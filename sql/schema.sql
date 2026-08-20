@@ -145,12 +145,70 @@ CREATE TABLE IF NOT EXISTS notes_mirror (
 
 -- ---------------------------------------------------------------- search
 
-CREATE VIRTUAL TABLE IF NOT EXISTS assertion_fts USING fts5(
-    predicate, value_text, content=''
-);
+-- External-content FTS: the index mirrors the real tables and is kept in sync by triggers,
+-- so no caller has to remember to update it. Contentless tables (content='') were tried
+-- first and rejected -- they do not support UPSERT, which made every write a special case.
+
 CREATE VIRTUAL TABLE IF NOT EXISTS entity_fts USING fts5(
-    name, description, content=''
+    name, description, content='entity', content_rowid='id'
 );
+CREATE TRIGGER IF NOT EXISTS entity_ai AFTER INSERT ON entity BEGIN
+    INSERT INTO entity_fts (rowid, name, description) VALUES (new.id, new.name, new.description);
+END;
+CREATE TRIGGER IF NOT EXISTS entity_ad AFTER DELETE ON entity BEGIN
+    INSERT INTO entity_fts (entity_fts, rowid, name, description)
+    VALUES ('delete', old.id, old.name, old.description);
+END;
+CREATE TRIGGER IF NOT EXISTS entity_au AFTER UPDATE ON entity BEGIN
+    INSERT INTO entity_fts (entity_fts, rowid, name, description)
+    VALUES ('delete', old.id, old.name, old.description);
+    INSERT INTO entity_fts (rowid, name, description) VALUES (new.id, new.name, new.description);
+END;
+
+CREATE VIRTUAL TABLE IF NOT EXISTS assertion_fts USING fts5(
+    predicate, value_text, content='assertion', content_rowid='id'
+);
+CREATE TRIGGER IF NOT EXISTS assertion_ai AFTER INSERT ON assertion BEGIN
+    INSERT INTO assertion_fts (rowid, predicate, value_text)
+    VALUES (new.id, new.predicate, new.value_text);
+END;
+CREATE TRIGGER IF NOT EXISTS assertion_ad AFTER DELETE ON assertion BEGIN
+    INSERT INTO assertion_fts (assertion_fts, rowid, predicate, value_text)
+    VALUES ('delete', old.id, old.predicate, old.value_text);
+END;
+
 CREATE VIRTUAL TABLE IF NOT EXISTS link_fts USING fts5(
-    url, title, content=''
+    url, title, content='link', content_rowid='id'
 );
+CREATE TRIGGER IF NOT EXISTS link_ai AFTER INSERT ON link BEGIN
+    INSERT INTO link_fts (rowid, url, title) VALUES (new.id, new.url, new.title);
+END;
+CREATE TRIGGER IF NOT EXISTS link_ad AFTER DELETE ON link BEGIN
+    INSERT INTO link_fts (link_fts, rowid, url, title) VALUES ('delete', old.id, old.url, old.title);
+END;
+
+-- ---------------------------------------------------------------- document text
+
+-- Extracted text lives here so it is searchable alongside everything else. Bodies of mail
+-- are deliberately NOT stored -- those stay in Mail and we keep only the Message-ID -- but
+-- files are ours to index, and searching them is how "what did I write about X" gets answered.
+CREATE TABLE IF NOT EXISTS document (
+    id         INTEGER PRIMARY KEY,
+    source_id  INTEGER NOT NULL UNIQUE REFERENCES source(id),
+    path       TEXT NOT NULL,
+    title      TEXT,
+    text       TEXT NOT NULL,
+    chars      INTEGER NOT NULL,
+    indexed_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS document_fts USING fts5(
+    title, text, content='document', content_rowid='id'
+);
+CREATE TRIGGER IF NOT EXISTS document_ai AFTER INSERT ON document BEGIN
+    INSERT INTO document_fts (rowid, title, text) VALUES (new.id, new.title, new.text);
+END;
+CREATE TRIGGER IF NOT EXISTS document_ad AFTER DELETE ON document BEGIN
+    INSERT INTO document_fts (document_fts, rowid, title, text)
+    VALUES ('delete', old.id, old.title, old.text);
+END;

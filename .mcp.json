@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "synth": {
+      "command": ".venv/bin/python",
+      "args": ["-m", "synth.mcp_server"],
+      "env": {"PYTHONPATH": "src"}
+    }
+  }
+}

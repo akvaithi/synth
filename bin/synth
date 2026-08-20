@@ -1,0 +1,5 @@
+#!/bin/bash
+exec "$HOME/Developer/synth/.venv/bin/python" -c "
+import sys; sys.path.insert(0, '$HOME/Developer/synth/src')
+from synth.cli import main; sys.exit(main())
+" "$@"
