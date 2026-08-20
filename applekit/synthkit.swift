@@ -447,6 +447,153 @@ func notesGet(id: String) throws -> [String: Any] {
     ]
 }
 
+
+
+func epochToISO(_ s: String) -> String {
+    guard let secs = Double(s.trimmingCharacters(in: .whitespacesAndNewlines)) else { return s }
+    return iso.string(from: Date(timeIntervalSince1970: secs))
+}
+
+// MARK: - Mail
+//
+// Read-only plus draft creation. There is deliberately no send path, and none may be added:
+// a sent message cannot be recalled and would be attributed to Arun. Drafting is the maximum
+// write that is ever acceptable here.
+
+func mailAccounts() throws -> [[String: Any]] {
+    let src = """
+    tell application "Mail"
+        set out to ""
+        repeat with a in accounts
+            set addrs to ""
+            try
+                set addrs to (email addresses of a) as string
+            end try
+            set out to out & (name of a) & (character id 31) & addrs & (character id 31) & ((enabled of a) as string) & (character id 30)
+        end repeat
+        return out
+    end tell
+    """
+    let raw = try runAppleScript(src)
+    var out: [[String: Any]] = []
+    for rec in raw.components(separatedBy: RS) where !rec.isEmpty {
+        let f = rec.components(separatedBy: US)
+        guard f.count >= 3 else { continue }
+        out.append(["name": f[0], "addresses": f[1], "enabled": f[2] == "true"])
+    }
+    return out
+}
+
+/// Recent inbox headers for one account. Headers and a short snippet only — full bodies
+/// come from mail_get, one explicit message at a time.
+func mailRecent(account: String, limit: Int) throws -> [[String: Any]] {
+    let src = """
+    tell application "Mail"
+        set out to ""
+        set acct to first account whose name is \(asQuote(account))
+        set box to mailbox "INBOX" of acct
+        set n to count of messages of box
+        if n > \(limit) then set n to \(limit)
+    set epochRef to (current date)
+        set year of epochRef to 1970
+        set month of epochRef to January
+        set day of epochRef to 1
+        set time of epochRef to 0
+
+        repeat with i from 1 to n
+            set m to message i of box
+            set mid to ""
+            try
+                set mid to message id of m
+            end try
+            set snip to ""
+            try
+                set snip to (characters 1 thru 240 of (content of m)) as string
+            on error
+                try
+                    set snip to (content of m) as string
+                end try
+            end try
+            set out to out & mid & (character id 31) & (subject of m) & (character id 31) & (sender of m) & (character id 31) & (((date received of m) - epochRef - (time to GMT)) as string) & (character id 31) & ((read status of m) as string) & (character id 31) & snip & (character id 30)
+        end repeat
+        return out
+    end tell
+    """
+    let raw = try runAppleScript(src)
+    var out: [[String: Any]] = []
+    for rec in raw.components(separatedBy: RS) where !rec.isEmpty {
+        let f = rec.components(separatedBy: US)
+        guard f.count >= 6 else { continue }
+        out.append([
+            "messageId": f[0], "subject": f[1], "sender": f[2],
+            "receivedAt": epochToISO(f[3]), "read": f[4] == "true",
+            "snippet": f[5...].joined(separator: US),
+        ])
+    }
+    return out
+}
+
+func mailGet(messageId: String) throws -> [String: Any] {
+    let src = """
+    tell application "Mail"
+        set found to missing value
+        repeat with a in accounts
+            try
+                set ms to (messages of mailbox "INBOX" of a whose message id is \(asQuote(messageId)))
+                if (count of ms) > 0 then
+                    set found to item 1 of ms
+                    exit repeat
+                end if
+            end try
+        end repeat
+        if found is missing value then return ""
+    set epochRef to (current date)
+        set year of epochRef to 1970
+        set month of epochRef to January
+        set day of epochRef to 1
+        set time of epochRef to 0
+        return (subject of found) & (character id 31) & (sender of found) & (character id 31) & (((date received of found) - epochRef - (time to GMT)) as string) & (character id 31) & (content of found)
+    end tell
+    """
+    let raw = try runAppleScript(src)
+    if raw.isEmpty { throw SynthError(msg: "no message with id \(messageId) in any inbox") }
+    let f = raw.components(separatedBy: US)
+    guard f.count >= 4 else { throw SynthError(msg: "unexpected mail_get response") }
+    return [
+        "messageId": messageId, "subject": f[0], "sender": f[1],
+        "receivedAt": epochToISO(f[2]), "body": f[3...].joined(separator: US),
+    ]
+}
+
+/// Creates a draft. Never sends. `visible:false` keeps a window from stealing focus.
+func mailDraft(_ req: [String: Any]) throws -> [String: Any] {
+    guard let subject = req["subject"] as? String,
+          let body = req["body"] as? String else {
+        throw SynthError(msg: "subject and body are required")
+    }
+    let recipients = (req["to"] as? [String]) ?? []
+    guard !recipients.isEmpty else { throw SynthError(msg: "at least one recipient is required") }
+    let account = req["account"] as? String
+    var senderLine = ""
+    if let a = account {
+        senderLine = "set sender of msg to (first email address of (first account whose name is \(asQuote(a))))"
+    }
+    var addLines = ""
+    for r in recipients {
+        addLines += "\n        make new to recipient at end of to recipients of msg with properties {address:\(asQuote(r))}"
+    }
+    let src = """
+    tell application "Mail"
+        set msg to make new outgoing message with properties {subject:\(asQuote(subject)), content:\(asQuote(body)), visible:false}
+        \(senderLine)\(addLines)
+        save msg
+        return "saved"
+    end tell
+    """
+    _ = try runAppleScript(src)
+    return ["drafted": true, "subject": subject, "to": recipients, "account": account ?? ""]
+}
+
 // MARK: - dispatch
 
 struct SynthError: Error { let msg: String }
@@ -513,6 +660,16 @@ func handle(_ req: [String: Any]) -> [String: Any] {
                 throw SynthError(msg: "id and body are required")
             }
             return ["ok": true, "result": try notesUpdate(id: id, body: body, name: req["name"] as? String)]
+        case "mail_accounts":
+            return ["ok": true, "result": try mailAccounts()]
+        case "mail_recent":
+            guard let a = req["account"] as? String else { throw SynthError(msg: "account is required") }
+            return ["ok": true, "result": try mailRecent(account: a, limit: (req["limit"] as? Int) ?? 25)]
+        case "mail_get":
+            guard let m = req["messageId"] as? String else { throw SynthError(msg: "messageId is required") }
+            return ["ok": true, "result": try mailGet(messageId: m)]
+        case "mail_draft":
+            return ["ok": true, "result": try mailDraft(req)]
         default:
             throw SynthError(msg: "unknown command: \(cmd)")
         }
