@@ -45,6 +45,10 @@ def run_claude(prompt: str, allowed: list[str], max_turns: int = 40,
     cmd = [
         CLAUDE, "-p", prompt,
         "--output-format", "json",
+        # Passing the MCP config explicitly avoids the interactive "pending approval"
+        # state that a project-scoped .mcp.json sits in, which no headless run can clear.
+        "--mcp-config", os.path.join(ROOT, ".mcp.json"),
+        "--strict-mcp-config",
         "--allowed-tools", ",".join(allowed),
         "--permission-mode", "acceptEdits",
         "--max-turns", str(max_turns),
