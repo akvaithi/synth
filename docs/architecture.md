@@ -39,3 +39,31 @@ code-signing certificate would give a stable identity across rebuilds — still 
 - `src/synth/applekit.py` — socket client. All Apple access from Python goes through `call()`.
 - `launchd/` — agent plists, copied to `~/Library/LaunchAgents/`.
 - `.state/` — socket, change queue, logs. Not in git.
+
+## Notes as the readable mirror (bidirectional)
+
+The mirror lives in an Apple Notes folder called `Synth`, not in iCloud Drive: it syncs
+everywhere, renders on the phone, and can be edited in place.
+
+Notes is driven through the daemon, because Apple Events carry the same responsible-process
+rule as EventKit. Only *named* Notes operations are exposed on the socket — there is
+deliberately no arbitrary-AppleScript passthrough, so the write policy stays mechanical.
+
+Two quirks that shape the renderer:
+
+- Notes treats the **first line of the body as the title**. Emitting an `<h1>` as well
+  duplicates it. The renderer writes the title as the first line and sets `name` to match.
+- Bodies round-trip as Notes' own HTML, not as what you wrote. So edits are compared on a
+  **whitespace-normalised text hash**, and a mismatch is treated as a correction *signal* for
+  the model to interpret — never as a literal diff to replay.
+
+`notes_mirror` holds, per document, the note id, the hash Synth last wrote, and the hash last
+observed. `last_written_hash != last_seen_hash` means you edited it.
+
+## Verified end to end
+
+- Calendar and Reminders: `fullAccess`, 12 calendars and 6 reminder lists.
+- Writes: create, partial update (unnamed fields untouched), complete, uncomplete, create
+  event — each returning prior state.
+- `action_log` + `db.undo()`: a real update reversed and the prior value restored.
+- A write with no stated reason is refused by `actions.UnexplainedWrite`.

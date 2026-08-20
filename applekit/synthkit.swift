@@ -115,6 +115,338 @@ func listReminders(includeCompleted: Bool) -> [[String: Any]] {
     return out
 }
 
+
+// MARK: - writes
+//
+// Doctrine: never delete. Completion, not deletion. Partial updates only — a field the
+// caller did not name is never cleared. Every write returns the prior state so the caller
+// can record an undo entry.
+
+func findReminderCalendar(_ nameOrId: String?) throws -> EKCalendar {
+    let cals = store.calendars(for: .reminder)
+    guard let want = nameOrId, !want.isEmpty else {
+        guard let d = store.defaultCalendarForNewReminders() else {
+            throw SynthError(msg: "no default reminder list")
+        }
+        return d
+    }
+    if let c = cals.first(where: { $0.calendarIdentifier == want || $0.title == want }) { return c }
+    throw SynthError(msg: "no reminder list named \(want)")
+}
+
+func findEventCalendar(_ nameOrId: String?) throws -> EKCalendar {
+    let cals = store.calendars(for: .event)
+    guard let want = nameOrId, !want.isEmpty else {
+        guard let d = store.defaultCalendarForNewEvents else {
+            throw SynthError(msg: "no default calendar")
+        }
+        return d
+    }
+    if let c = cals.first(where: { $0.calendarIdentifier == want || $0.title == want }) { return c }
+    throw SynthError(msg: "no calendar named \(want)")
+}
+
+func parseDate(_ s: String?) -> Date? {
+    guard let s = s, !s.isEmpty else { return nil }
+    if let d = iso.date(from: s) { return d }
+    let f = ISO8601DateFormatter()
+    f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    if let d = f.date(from: s) { return d }
+    let df = DateFormatter()
+    df.dateFormat = "yyyy-MM-dd"
+    df.timeZone = TimeZone.current
+    return df.date(from: s)
+}
+
+func dueComponents(_ d: Date, hasTime: Bool) -> DateComponents {
+    let cal = Calendar.current
+    return hasTime
+        ? cal.dateComponents([.year, .month, .day, .hour, .minute, .second], from: d)
+        : cal.dateComponents([.year, .month, .day], from: d)
+}
+
+func fetchReminder(id: String) throws -> EKReminder {
+    guard let item = store.calendarItem(withIdentifier: id) as? EKReminder else {
+        throw SynthError(msg: "no reminder with identifier \(id)")
+    }
+    return item
+}
+
+func reminderSnapshot(_ r: EKReminder) -> [String: Any] {
+    var due = ""
+    if let dc = r.dueDateComponents, let d = Calendar.current.date(from: dc) {
+        due = iso.string(from: d)
+    }
+    return [
+        "id": r.calendarItemIdentifier,
+        "title": r.title ?? "",
+        "list": r.calendar?.title ?? "",
+        "due": due,
+        "hasTime": r.dueDateComponents?.hour != nil,
+        "completed": r.isCompleted,
+        "notes": r.notes ?? "",
+        "priority": r.priority,
+    ]
+}
+
+func eventSnapshot(_ e: EKEvent) -> [String: Any] {
+    return [
+        "id": e.eventIdentifier ?? "",
+        "title": e.title ?? "",
+        "start": e.startDate.map { iso.string(from: $0) } ?? "",
+        "end": e.endDate.map { iso.string(from: $0) } ?? "",
+        "allDay": e.isAllDay,
+        "calendar": e.calendar?.title ?? "",
+        "location": e.location ?? "",
+        "notes": e.hasNotes ? (e.notes ?? "") : "",
+    ]
+}
+
+func createReminder(_ req: [String: Any]) throws -> [String: Any] {
+    guard let title = req["title"] as? String, !title.isEmpty else {
+        throw SynthError(msg: "title is required")
+    }
+    let cal = try findReminderCalendar(req["list"] as? String)
+    guard cal.allowsContentModifications else {
+        throw SynthError(msg: "reminder list \(cal.title) is read-only")
+    }
+    let r = EKReminder(eventStore: store)
+    r.title = title
+    r.calendar = cal
+    if let n = req["notes"] as? String, !n.isEmpty { r.notes = n }
+    if let p = req["priority"] as? Int { r.priority = p }
+    if let d = parseDate(req["due"] as? String) {
+        let hasTime = (req["hasTime"] as? Bool) ?? ((req["due"] as? String)?.contains("T") ?? false)
+        r.dueDateComponents = dueComponents(d, hasTime: hasTime)
+        if hasTime {
+            r.addAlarm(EKAlarm(absoluteDate: d))
+        }
+    }
+    try store.save(r, commit: true)
+    return ["created": reminderSnapshot(r), "before": NSNull()]
+}
+
+func completeReminder(_ req: [String: Any]) throws -> [String: Any] {
+    guard let id = req["id"] as? String else { throw SynthError(msg: "id is required") }
+    let r = try fetchReminder(id: id)
+    let before = reminderSnapshot(r)
+    if !r.isCompleted {
+        r.isCompleted = true
+        r.completionDate = Date()
+        try store.save(r, commit: true)
+    }
+    return ["after": reminderSnapshot(r), "before": before]
+}
+
+func uncompleteReminder(_ req: [String: Any]) throws -> [String: Any] {
+    guard let id = req["id"] as? String else { throw SynthError(msg: "id is required") }
+    let r = try fetchReminder(id: id)
+    let before = reminderSnapshot(r)
+    r.isCompleted = false
+    r.completionDate = nil
+    try store.save(r, commit: true)
+    return ["after": reminderSnapshot(r), "before": before]
+}
+
+func updateReminder(_ req: [String: Any]) throws -> [String: Any] {
+    guard let id = req["id"] as? String else { throw SynthError(msg: "id is required") }
+    let r = try fetchReminder(id: id)
+    let before = reminderSnapshot(r)
+    // Partial: only named fields are touched.
+    if let t = req["title"] as? String { r.title = t }
+    if let n = req["notes"] as? String { r.notes = n }
+    if let p = req["priority"] as? Int { r.priority = p }
+    if let dueStr = req["due"] as? String, let d = parseDate(dueStr) {
+        let hasTime = (req["hasTime"] as? Bool) ?? dueStr.contains("T")
+        r.dueDateComponents = dueComponents(d, hasTime: hasTime)
+    }
+    if let listName = req["list"] as? String {
+        let cal = try findReminderCalendar(listName)
+        guard cal.allowsContentModifications else {
+            throw SynthError(msg: "reminder list \(cal.title) is read-only")
+        }
+        r.calendar = cal
+    }
+    try store.save(r, commit: true)
+    return ["after": reminderSnapshot(r), "before": before]
+}
+
+func createEvent(_ req: [String: Any]) throws -> [String: Any] {
+    guard let title = req["title"] as? String, !title.isEmpty else {
+        throw SynthError(msg: "title is required")
+    }
+    guard let start = parseDate(req["start"] as? String) else {
+        throw SynthError(msg: "start is required (ISO 8601)")
+    }
+    let cal = try findEventCalendar(req["calendar"] as? String)
+    guard cal.allowsContentModifications else {
+        throw SynthError(msg: "calendar \(cal.title) is read-only")
+    }
+    let e = EKEvent(eventStore: store)
+    e.title = title
+    e.calendar = cal
+    e.startDate = start
+    e.endDate = parseDate(req["end"] as? String)
+        ?? Calendar.current.date(byAdding: .hour, value: 1, to: start)!
+    if let allDay = req["allDay"] as? Bool { e.isAllDay = allDay }
+    if let loc = req["location"] as? String, !loc.isEmpty { e.location = loc }
+    if let n = req["notes"] as? String, !n.isEmpty { e.notes = n }
+    try store.save(e, span: .thisEvent, commit: true)
+    return ["created": eventSnapshot(e), "before": NSNull()]
+}
+
+func updateEvent(_ req: [String: Any]) throws -> [String: Any] {
+    guard let id = req["id"] as? String else { throw SynthError(msg: "id is required") }
+    guard let e = store.event(withIdentifier: id) else {
+        throw SynthError(msg: "no event with identifier \(id)")
+    }
+    let before = eventSnapshot(e)
+    if let t = req["title"] as? String { e.title = t }
+    if let s = parseDate(req["start"] as? String) { e.startDate = s }
+    if let en = parseDate(req["end"] as? String) { e.endDate = en }
+    if let loc = req["location"] as? String { e.location = loc }
+    if let n = req["notes"] as? String { e.notes = n }
+    try store.save(e, span: .thisEvent, commit: true)
+    return ["after": eventSnapshot(e), "before": before]
+}
+
+
+// MARK: - AppleScript / Notes
+//
+// Apple Events carry the same responsible-process rule as EventKit, so Notes and Mail are
+// driven from inside this daemon rather than from a shell. Only named operations are exposed
+// — there is deliberately no arbitrary-script passthrough on the socket.
+
+let US = "\u{1F}"   // unit separator, between fields
+let RS = "\u{1E}"   // record separator, between notes
+
+func runAppleScript(_ src: String) throws -> String {
+    var result: String = ""
+    var thrown: String? = nil
+    let work = {
+        var errInfo: NSDictionary?
+        guard let script = NSAppleScript(source: src) else {
+            thrown = "could not compile AppleScript"
+            return
+        }
+        let out = script.executeAndReturnError(&errInfo)
+        if let e = errInfo {
+            let msg = (e[NSAppleScript.errorMessage] as? String) ?? "\(e)"
+            let num = (e[NSAppleScript.errorNumber] as? Int).map { " (\($0))" } ?? ""
+            thrown = "applescript: \(msg)\(num)"
+            return
+        }
+        result = out.stringValue ?? ""
+    }
+    if Thread.isMainThread { work() } else { DispatchQueue.main.sync(execute: work) }
+    if let t = thrown { throw SynthError(msg: t) }
+    return result
+}
+
+func asQuote(_ s: String) -> String {
+    let escaped = s
+        .replacingOccurrences(of: "\\", with: "\\\\")
+        .replacingOccurrences(of: "\"", with: "\\\"")
+    return "\"\(escaped)\""
+}
+
+func notesFolders() throws -> [String] {
+    let src = """
+    tell application "Notes"
+        set out to ""
+        repeat with f in folders
+            set out to out & (name of f) & (character id 30)
+        end repeat
+        return out
+    end tell
+    """
+    return try runAppleScript(src)
+        .components(separatedBy: RS)
+        .filter { !$0.isEmpty }
+}
+
+func notesEnsureFolder(_ name: String) throws -> Bool {
+    let existing = try notesFolders()
+    if existing.contains(name) { return false }
+    let src = """
+    tell application "Notes"
+        make new folder with properties {name:\(asQuote(name))}
+    end tell
+    """
+    _ = try runAppleScript(src)
+    return true
+}
+
+/// id, name and body for every note in a folder. Bodies are small and the caller hashes
+/// them to detect edits, which is far more robust than parsing AppleScript's localised dates.
+func notesDump(folder: String) throws -> [[String: Any]] {
+    let src = """
+    tell application "Notes"
+        set out to ""
+        repeat with n in notes of folder \(asQuote(folder))
+            set out to out & (id of n) & (character id 31) & (name of n) & (character id 31) & (body of n) & (character id 30)
+        end repeat
+        return out
+    end tell
+    """
+    let raw = try runAppleScript(src)
+    var result: [[String: Any]] = []
+    for rec in raw.components(separatedBy: RS) where !rec.isEmpty {
+        let parts = rec.components(separatedBy: US)
+        guard parts.count >= 3 else { continue }
+        result.append([
+            "id": parts[0],
+            "name": parts[1],
+            "body": parts[2...].joined(separator: US),
+        ])
+    }
+    return result
+}
+
+func notesCreate(folder: String, name: String, body: String) throws -> [String: Any] {
+    _ = try notesEnsureFolder(folder)
+    let src = """
+    tell application "Notes"
+        set n to make new note at folder \(asQuote(folder)) with properties {name:\(asQuote(name)), body:\(asQuote(body))}
+        return id of n
+    end tell
+    """
+    let id = try runAppleScript(src)
+    return ["id": id, "name": name, "folder": folder]
+}
+
+func notesUpdate(id: String, body: String, name: String?) throws -> [String: Any] {
+    var setName = ""
+    if let n = name { setName = "set name of theNote to \(asQuote(n))" }
+    let src = """
+    tell application "Notes"
+        set theNote to note id \(asQuote(id))
+        set oldBody to body of theNote
+        set body of theNote to \(asQuote(body))
+        \(setName)
+        return oldBody
+    end tell
+    """
+    let old = try runAppleScript(src)
+    return ["id": id, "before": ["body": old]]
+}
+
+func notesGet(id: String) throws -> [String: Any] {
+    let src = """
+    tell application "Notes"
+        set theNote to note id \(asQuote(id))
+        return (name of theNote) & (character id 31) & (body of theNote)
+    end tell
+    """
+    let raw = try runAppleScript(src)
+    let parts = raw.components(separatedBy: US)
+    return [
+        "id": id,
+        "name": parts.first ?? "",
+        "body": parts.count > 1 ? parts[1...].joined(separator: US) : "",
+    ]
+}
+
 // MARK: - dispatch
 
 struct SynthError: Error { let msg: String }
@@ -148,6 +480,39 @@ func handle(_ req: [String: Any]) -> [String: Any] {
         case "reminders":
             let inc = (req["includeCompleted"] as? Bool) ?? false
             return ["ok": true, "result": listReminders(includeCompleted: inc)]
+        case "create_reminder":
+            return ["ok": true, "result": try createReminder(req)]
+        case "complete_reminder":
+            return ["ok": true, "result": try completeReminder(req)]
+        case "uncomplete_reminder":
+            return ["ok": true, "result": try uncompleteReminder(req)]
+        case "update_reminder":
+            return ["ok": true, "result": try updateReminder(req)]
+        case "create_event":
+            return ["ok": true, "result": try createEvent(req)]
+        case "update_event":
+            return ["ok": true, "result": try updateEvent(req)]
+        case "notes_folders":
+            return ["ok": true, "result": try notesFolders()]
+        case "notes_ensure_folder":
+            guard let n = req["folder"] as? String else { throw SynthError(msg: "folder is required") }
+            return ["ok": true, "result": ["created": try notesEnsureFolder(n)]]
+        case "notes_dump":
+            let f = (req["folder"] as? String) ?? "Synth"
+            return ["ok": true, "result": try notesDump(folder: f)]
+        case "notes_get":
+            guard let id = req["id"] as? String else { throw SynthError(msg: "id is required") }
+            return ["ok": true, "result": try notesGet(id: id)]
+        case "notes_create":
+            guard let name = req["name"] as? String, let body = req["body"] as? String else {
+                throw SynthError(msg: "name and body are required")
+            }
+            return ["ok": true, "result": try notesCreate(folder: (req["folder"] as? String) ?? "Synth", name: name, body: body)]
+        case "notes_update":
+            guard let id = req["id"] as? String, let body = req["body"] as? String else {
+                throw SynthError(msg: "id and body are required")
+            }
+            return ["ok": true, "result": try notesUpdate(id: id, body: body, name: req["name"] as? String)]
         default:
             throw SynthError(msg: "unknown command: \(cmd)")
         }
