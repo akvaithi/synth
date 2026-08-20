@@ -1,0 +1,6 @@
+.venv/
+.state/
+bin/Synth.app/
+__pycache__/
+*.pyc
+synth.db

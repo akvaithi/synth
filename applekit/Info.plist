@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>page.akvaithi.synth</string>
+    <key>CFBundleName</key>
+    <string>Synth</string>
+    <key>CFBundleDisplayName</key>
+    <string>Synth</string>
+    <key>CFBundleExecutable</key>
+    <string>synthkit</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>LSUIElement</key>
+    <true/>
+    <key>NSCalendarsFullAccessUsageDescription</key>
+    <string>Synth reads and schedules your calendar events.</string>
+    <key>NSRemindersFullAccessUsageDescription</key>
+    <string>Synth reads, creates and completes your reminders.</string>
+    <key>NSCalendarsUsageDescription</key>
+    <string>Synth reads and schedules your calendar events.</string>
+    <key>NSRemindersUsageDescription</key>
+    <string>Synth reads, creates and completes your reminders.</string>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>Synth reads your mail and saves email drafts through Mail.</string>
+</dict>
+</plist>
