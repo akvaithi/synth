@@ -484,6 +484,209 @@ func mailAccounts() throws -> [[String: Any]] {
     return out
 }
 
+/// Resolves a message by (account, mailbox, index) and verifies its Message-ID matches
+/// what the caller expected. Indices shift as mail arrives, so the id is the safety check —
+/// but addressing by index is the difference between milliseconds and minutes, because
+/// `whose message id is ...` walks the entire mailbox.
+func messageRef(account: String, mailbox: String, index: Int) -> String {
+    return """
+    set acct to first account whose name is \(asQuote(account))
+    set box to missing value
+    repeat with mb in mailboxes of acct
+        set nm to name of mb
+        if nm is \(asQuote(mailbox)) or nm ends with ("/" & \(asQuote(mailbox))) then
+            set box to mb
+            exit repeat
+        end if
+    end repeat
+    if box is missing value then error "no mailbox named " & \(asQuote(mailbox))
+    set m to message \(index) of box
+    """
+}
+
+func mailAttachments(account: String, mailbox: String, index: Int, expectId: String) throws -> [String: Any] {
+    let src = """
+    tell application "Mail"
+        \(messageRef(account: account, mailbox: mailbox, index: index))
+        set actualId to message id of m
+        if actualId is not \(asQuote(expectId)) then return "MISMATCH" & (character id 31) & actualId
+        set out to "OK" & (character id 30)
+        -- Every property is guarded: Mail raises -10000 on some attachments (inline parts,
+        -- undownloaded items) rather than returning a value, and one bad attachment must
+        -- not lose the whole message.
+        try
+            repeat with att in mail attachments of m
+                set aname to "(unnamed)"
+                try
+                    set aname to (name of att) as string
+                end try
+                set amime to "application/octet-stream"
+                try
+                    set amime to (MIME type of att) as string
+                end try
+                set sz to "0"
+                try
+                    set sz to ((file size of att) as string)
+                end try
+                set dl to "false"
+                try
+                    set dl to ((downloaded of att) as string)
+                end try
+                set out to out & aname & (character id 31) & amime & (character id 31) & sz & (character id 31) & dl & (character id 30)
+            end repeat
+        end try
+        return out
+    end tell
+    """
+    let raw = try runAppleScript(src)
+    var recs = raw.components(separatedBy: RS).filter { !$0.isEmpty }
+    guard let head = recs.first else { return ["matched": false, "attachments": []] }
+    if head.hasPrefix("MISMATCH") {
+        return ["matched": false, "attachments": []]
+    }
+    recs.removeFirst()
+    var out: [[String: Any]] = []
+    for rec in recs {
+        let f = rec.components(separatedBy: US)
+        guard f.count >= 4 else { continue }
+        out.append([
+            "name": f[0], "mimeType": f[1],
+            "size": Int(f[2]) ?? 0, "downloaded": f[3] == "true",
+        ])
+    }
+    return ["matched": true, "attachments": out]
+}
+
+func mailGetAt(account: String, mailbox: String, index: Int, expectId: String) throws -> [String: Any] {
+    let src = """
+    tell application "Mail"
+        \(messageRef(account: account, mailbox: mailbox, index: index))
+        set actualId to message id of m
+        if actualId is not \(asQuote(expectId)) then return "MISMATCH"
+        with timeout of 600 seconds
+            set b to content of m
+        end timeout
+        return (subject of m) & (character id 31) & (sender of m) & (character id 31) & b
+    end tell
+    """
+    let raw = try runAppleScript(src)
+    if raw == "MISMATCH" { throw SynthError(msg: "index no longer points at \(expectId)") }
+    let f = raw.components(separatedBy: US)
+    guard f.count >= 3 else { throw SynthError(msg: "unexpected mail_get response") }
+    return ["messageId": expectId, "subject": f[0], "sender": f[1],
+            "body": f[2...].joined(separator: US)]
+}
+
+func mailSaveAttachment(account: String, mailbox: String, index: Int,
+                        name: String, directory: String) throws -> [String: Any] {
+    try FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
+    let dest = (directory as NSString).appendingPathComponent(name)
+    let src = """
+    tell application "Mail"
+        \(messageRef(account: account, mailbox: mailbox, index: index))
+        set saved to "no"
+        repeat with att in mail attachments of m
+            if (name of att) is \(asQuote(name)) then
+                with timeout of 600 seconds
+                    save att in POSIX file \(asQuote(dest))
+                end timeout
+                set saved to "yes"
+                exit repeat
+            end if
+        end repeat
+        return saved
+    end tell
+    """
+    let ok = try runAppleScript(src)
+    guard ok == "yes", FileManager.default.fileExists(atPath: dest) else {
+        throw SynthError(msg: "could not save attachment \(name)")
+    }
+    let attrs = try FileManager.default.attributesOfItem(atPath: dest)
+    return ["path": dest, "bytes": (attrs[.size] as? Int) ?? 0, "name": name]
+}
+
+/// Forces Mail to fetch bodies for a range of messages by reading their content in bulk.
+///
+/// Bulk access is the whole point: `content of (messages a thru b of box)` is one Apple
+/// Event that makes Mail download every uncached body in the range, where a per-message
+/// loop pays a round trip each time. Only the total byte count comes back — the bodies stay
+/// in Mail's cache, which is where we want them, and nothing is copied into Synth.
+func mailWarm(account: String, mailbox: String, offset: Int, limit: Int) throws -> [String: Any] {
+    let src = """
+    tell application "Mail"
+        set acct to first account whose name is \(asQuote(account))
+        -- Gmail nests mailboxes under [Gmail]/, so addressing by leaf name fails with -1728.
+        -- Resolve by iteration and accept either the leaf or the full path.
+        set box to missing value
+        repeat with mb in mailboxes of acct
+            set nm to name of mb
+            if nm is \(asQuote(mailbox)) or nm ends with ("/" & \(asQuote(mailbox))) then
+                set box to mb
+                exit repeat
+            end if
+        end repeat
+        if box is missing value then error "no mailbox named " & \(asQuote(mailbox))
+        set n to count of messages of box
+        set a to \(offset)
+        if a > n then return "0" & (character id 31) & (n as string)
+        set b to a + \(limit) - 1
+        set if_ to 0
+        if b > n then set b to n
+        set total to 0
+        set errMsg to "none"
+        -- The default Apple Event timeout is two minutes, which uncached historical
+        -- messages routinely exceed while Mail fetches them from the server.
+        with timeout of 900 seconds
+            try
+                set bodies to content of (messages a thru b of box)
+                repeat with c in bodies
+                    try
+                        set total to total + (length of c)
+                    end try
+                end repeat
+            on error e
+                set errMsg to e
+            end try
+        end timeout
+        return ((b - a + 1) as string) & (character id 31) & (n as string) & (character id 31) & (total as string) & (character id 31) & errMsg
+    end tell
+    """
+    let raw = try runAppleScript(src)
+    let f = raw.components(separatedBy: US)
+    return [
+        "account": account, "mailbox": mailbox, "offset": offset,
+        "fetched": Int(f.first ?? "0") ?? 0,
+        "mailboxTotal": f.count > 1 ? (Int(f[1]) ?? 0) : 0,
+        "bytes": f.count > 2 ? (Int(f[2]) ?? 0) : 0,
+        "error": f.count > 3 ? f[3] : "none",
+    ]
+}
+
+/// Mailbox inventory: every mailbox in an account with its message count. Used to size a
+/// bulk body-download before committing to it.
+func mailInventory(account: String) throws -> [[String: Any]] {
+    let src = """
+    tell application "Mail"
+        set acct to first account whose name is \(asQuote(account))
+        set out to ""
+        repeat with mb in mailboxes of acct
+            try
+                set out to out & (name of mb) & (character id 31) & ((count of messages of mb) as string) & (character id 30)
+            end try
+        end repeat
+        return out
+    end tell
+    """
+    let raw = try runAppleScript(src)
+    var out: [[String: Any]] = []
+    for rec in raw.components(separatedBy: RS) where !rec.isEmpty {
+        let f = rec.components(separatedBy: US)
+        guard f.count >= 2 else { continue }
+        out.append(["mailbox": f[0], "count": Int(f[1]) ?? 0])
+    }
+    return out
+}
+
 /// Cheap change sentinel: the id of the newest inbox message plus the message count.
 /// Two property fetches per account instead of five bulk lists, so steady-state polling
 /// costs ~2s across all accounts. The expensive header fetch runs only when this moves.
@@ -530,6 +733,8 @@ func mailRecent(account: String, limit: Int) throws -> [[String: Any]] {
         -- Bulk property access must name the reference inline. Assigning the messages to a
         -- variable first materialises a list of specifiers and then each property fetch
         -- fails with -1728.
+        -- Index is returned so later calls can address a message directly. Scanning with
+        -- `whose message id is ...` walks the whole mailbox and takes minutes on a 23k inbox.
         set ids to message id of (messages 1 thru n of box)
         set subs to subject of (messages 1 thru n of box)
         set sndrs to sender of (messages 1 thru n of box)
@@ -538,7 +743,7 @@ func mailRecent(account: String, limit: Int) throws -> [[String: Any]] {
         set out to ""
         repeat with i from 1 to n
             set d to ((item i of dts) - epochRef - (time to GMT)) as string
-            set out to out & (item i of ids) & (character id 31) & (item i of subs) & (character id 31) & (item i of sndrs) & (character id 31) & d & (character id 31) & ((item i of rds) as string) & (character id 30)
+            set out to out & (item i of ids) & (character id 31) & (item i of subs) & (character id 31) & (item i of sndrs) & (character id 31) & d & (character id 31) & ((item i of rds) as string) & (character id 31) & (i as string) & (character id 30)
         end repeat
         return out
     end tell
@@ -547,10 +752,11 @@ func mailRecent(account: String, limit: Int) throws -> [[String: Any]] {
     var out: [[String: Any]] = []
     for rec in raw.components(separatedBy: RS) where !rec.isEmpty {
         let f = rec.components(separatedBy: US)
-        guard f.count >= 5 else { continue }
+        guard f.count >= 6 else { continue }
         out.append([
             "messageId": f[0], "subject": f[1], "sender": f[2],
             "receivedAt": epochToISO(f[3]), "read": f[4] == "true",
+            "index": Int(f[5]) ?? 0,
         ])
     }
     return out
@@ -625,6 +831,13 @@ func handle(_ req: [String: Any]) -> [String: Any] {
     let cmd = (req["cmd"] as? String) ?? "probe"
     do {
         switch cmd {
+        case "status":
+            // Reads recorded authorization without requesting, so this never raises a
+            // dialog and can be used to check whether a grant actually survived a rebuild.
+            return ["ok": true, "result": [
+                "calendar": authString(EKEventStore.authorizationStatus(for: .event)),
+                "reminders": authString(EKEventStore.authorizationStatus(for: .reminder)),
+            ]]
         case "diag":
             return ["ok": true, "result": diag()]
         case "ping":
@@ -687,6 +900,43 @@ func handle(_ req: [String: Any]) -> [String: Any] {
             return ["ok": true, "result": try notesUpdate(id: id, body: body, name: req["name"] as? String)]
         case "mail_accounts":
             return ["ok": true, "result": try mailAccounts()]
+        case "mail_attachments":
+            guard let a = req["account"] as? String, let idx = req["index"] as? Int,
+                  let mid = req["messageId"] as? String else {
+                throw SynthError(msg: "account, index and messageId are required")
+            }
+            return ["ok": true, "result": try mailAttachments(
+                account: a, mailbox: (req["mailbox"] as? String) ?? "INBOX",
+                index: idx, expectId: mid)]
+        case "mail_get_at":
+            guard let a = req["account"] as? String, let idx = req["index"] as? Int,
+                  let mid = req["messageId"] as? String else {
+                throw SynthError(msg: "account, index and messageId are required")
+            }
+            return ["ok": true, "result": try mailGetAt(
+                account: a, mailbox: (req["mailbox"] as? String) ?? "INBOX",
+                index: idx, expectId: mid)]
+        case "mail_save_attachment":
+            guard let a = req["account"] as? String, let idx = req["index"] as? Int,
+                  let nm = req["name"] as? String else {
+                throw SynthError(msg: "account, index and name are required")
+            }
+            let dir = (req["directory"] as? String)
+                ?? FileManager.default.homeDirectoryForCurrentUser.path + "/Developer/synth/.state/attachments"
+            return ["ok": true, "result": try mailSaveAttachment(
+                account: a, mailbox: (req["mailbox"] as? String) ?? "INBOX",
+                index: idx, name: nm, directory: dir)]
+        case "mail_warm":
+            guard let a = req["account"] as? String, let mb = req["mailbox"] as? String else {
+                throw SynthError(msg: "account and mailbox are required")
+            }
+            return ["ok": true, "result": try mailWarm(
+                account: a, mailbox: mb,
+                offset: (req["offset"] as? Int) ?? 1,
+                limit: (req["limit"] as? Int) ?? 50)]
+        case "mail_inventory":
+            guard let a = req["account"] as? String else { throw SynthError(msg: "account is required") }
+            return ["ok": true, "result": try mailInventory(account: a)]
         case "mail_probe":
             guard let a = req["account"] as? String else { throw SynthError(msg: "account is required") }
             return ["ok": true, "result": try mailProbe(account: a)]
@@ -912,3 +1162,5 @@ if cmd == "daemon" {
     if args.contains("--include-completed") { req["includeCompleted"] = true }
     print(encode(handle(req)))
 }
+
+// rebuild marker 1787266493

@@ -67,3 +67,37 @@ observed. `last_written_hash != last_seen_hash` means you edited it.
   event — each returning prior state.
 - `action_log` + `db.undo()`: a real update reversed and the prior value restored.
 - A write with no stated reason is refused by `actions.UnexplainedWrite`.
+
+## Mail: what is cheap and what is not
+
+Measured on this install, not assumed:
+
+| Operation | Cost |
+|---|---|
+| `mail_probe` (newest id + count) | ~2s per account — the steady-state sentinel |
+| `mail_recent` (bulk headers, 25) | 15–48s per account — only when the sentinel moves |
+| `mail_get_at` (body, index-addressed) | ~3.6s |
+| body fetch, already cached | ~0.5s/msg |
+| body fetch, cold from server | ~5s/msg |
+| finding a message by `whose message id is …` | **minutes** — never do this |
+
+Consequences baked into the code:
+
+- **Address messages by (account, mailbox, index) and verify the Message-ID.** Searching a
+  23,000-message inbox by id takes minutes; index addressing takes milliseconds. Indices shift
+  as mail arrives, so the id is the correctness check and a mismatch is reported, not guessed.
+- **Detection never touches `content`.** Reading a body can force a download from the server;
+  an early version did this during detection and took over ten minutes per pass.
+- **Apple Events need an explicit `with timeout of`.** The 2-minute default expires while Mail
+  fetches uncached history, and the failure looks like an empty body rather than an error.
+- **Bulk range access works; per-message loops do not.** `content of (messages a thru b of box)`
+  returns real bodies, while `content of message i of box` returns empty instantly.
+- **Attachment properties must each be guarded.** Mail raises -10000 on some parts rather than
+  returning a value, and one bad attachment should not lose the message.
+
+A full-archive warm is ~42,000 unique messages at ~5s/msg cold — roughly 60 hours. Not worth
+it. Recent mail is already cached, including attachments, and that is what Synth reasons over.
+Older messages are fetched on demand, which also caches them.
+
+Known gap: Mail's AppleScript reports every attachment as `application/octet-stream`, so type
+must be inferred from the filename extension. Text extraction from PDF and .docx is not built.
