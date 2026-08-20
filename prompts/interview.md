@@ -9,8 +9,9 @@ what only he knows: intent, judgement, constraints, and the things he would neve
   means to him, in his words, not in the abstract.
 - **Constraints**: what he will not do, what he has already ruled out and why, what he is
   quietly worried about. These prevent more bad suggestions than any preference does.
-- **Honest scope**: for each significant project or role already in the database, what the true claim is where the record over-reaches. Correct it now — it is
-  真 claim is. Where the record over-reaches, correct it now — it is binding afterwards.
+- **Honest scope**: for each significant project or role already in the database, what
+  the true claim is. Where the record over-reaches, correct it now — it is binding
+  afterwards.
 - **People**: who matters, in what capacity, and what he owes them.
 - **Judgement calls**: how he wants trade-offs made when Synth has to choose — speed versus
   certainty, breadth versus depth, when to interrupt him.
