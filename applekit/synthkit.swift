@@ -484,37 +484,61 @@ func mailAccounts() throws -> [[String: Any]] {
     return out
 }
 
-/// Recent inbox headers for one account. Headers and a short snippet only — full bodies
-/// come from mail_get, one explicit message at a time.
-func mailRecent(account: String, limit: Int) throws -> [[String: Any]] {
+/// Cheap change sentinel: the id of the newest inbox message plus the message count.
+/// Two property fetches per account instead of five bulk lists, so steady-state polling
+/// costs ~2s across all accounts. The expensive header fetch runs only when this moves.
+func mailProbe(account: String) throws -> [String: Any] {
     let src = """
     tell application "Mail"
-        set out to ""
         set acct to first account whose name is \(asQuote(account))
         set box to mailbox "INBOX" of acct
         set n to count of messages of box
+        if n = 0 then return "0" & (character id 31) & ""
+        return (n as string) & (character id 31) & (message id of message 1 of box)
+    end tell
+    """
+    let raw = try runAppleScript(src)
+    let f = raw.components(separatedBy: US)
+    return [
+        "account": account,
+        "count": Int(f.first ?? "0") ?? 0,
+        "newestId": f.count > 1 ? f[1] : "",
+    ]
+}
+
+/// Recent inbox headers for one account.
+///
+/// Bulk property access matters enormously here: asking for `message id of messages 1 thru n`
+/// is one Apple Event, where looping `message i of box` is one per message per property. The
+/// looping version took over ten minutes across four accounts. This one is seconds.
+///
+/// Headers only — never `content`, which can force Mail to download the body from the server.
+/// Bodies come from mail_get, one explicit message at a time.
+func mailRecent(account: String, limit: Int) throws -> [[String: Any]] {
+    let src = """
+    tell application "Mail"
+        set acct to first account whose name is \(asQuote(account))
+        set box to mailbox "INBOX" of acct
+        set n to count of messages of box
+        if n = 0 then return ""
         if n > \(limit) then set n to \(limit)
-    set epochRef to (current date)
+        set epochRef to (current date)
         set year of epochRef to 1970
         set month of epochRef to January
         set day of epochRef to 1
         set time of epochRef to 0
-
+        -- Bulk property access must name the reference inline. Assigning the messages to a
+        -- variable first materialises a list of specifiers and then each property fetch
+        -- fails with -1728.
+        set ids to message id of (messages 1 thru n of box)
+        set subs to subject of (messages 1 thru n of box)
+        set sndrs to sender of (messages 1 thru n of box)
+        set dts to date received of (messages 1 thru n of box)
+        set rds to read status of (messages 1 thru n of box)
+        set out to ""
         repeat with i from 1 to n
-            set m to message i of box
-            set mid to ""
-            try
-                set mid to message id of m
-            end try
-            set snip to ""
-            try
-                set snip to (characters 1 thru 240 of (content of m)) as string
-            on error
-                try
-                    set snip to (content of m) as string
-                end try
-            end try
-            set out to out & mid & (character id 31) & (subject of m) & (character id 31) & (sender of m) & (character id 31) & (((date received of m) - epochRef - (time to GMT)) as string) & (character id 31) & ((read status of m) as string) & (character id 31) & snip & (character id 30)
+            set d to ((item i of dts) - epochRef - (time to GMT)) as string
+            set out to out & (item i of ids) & (character id 31) & (item i of subs) & (character id 31) & (item i of sndrs) & (character id 31) & d & (character id 31) & ((item i of rds) as string) & (character id 30)
         end repeat
         return out
     end tell
@@ -523,11 +547,10 @@ func mailRecent(account: String, limit: Int) throws -> [[String: Any]] {
     var out: [[String: Any]] = []
     for rec in raw.components(separatedBy: RS) where !rec.isEmpty {
         let f = rec.components(separatedBy: US)
-        guard f.count >= 6 else { continue }
+        guard f.count >= 5 else { continue }
         out.append([
             "messageId": f[0], "subject": f[1], "sender": f[2],
             "receivedAt": epochToISO(f[3]), "read": f[4] == "true",
-            "snippet": f[5...].joined(separator: US),
         ])
     }
     return out
@@ -602,6 +625,8 @@ func handle(_ req: [String: Any]) -> [String: Any] {
     let cmd = (req["cmd"] as? String) ?? "probe"
     do {
         switch cmd {
+        case "diag":
+            return ["ok": true, "result": diag()]
         case "ping":
             return ["ok": true, "result": ["pong": true, "pid": ProcessInfo.processInfo.processIdentifier]]
         case "probe":
@@ -662,6 +687,9 @@ func handle(_ req: [String: Any]) -> [String: Any] {
             return ["ok": true, "result": try notesUpdate(id: id, body: body, name: req["name"] as? String)]
         case "mail_accounts":
             return ["ok": true, "result": try mailAccounts()]
+        case "mail_probe":
+            guard let a = req["account"] as? String else { throw SynthError(msg: "account is required") }
+            return ["ok": true, "result": try mailProbe(account: a)]
         case "mail_recent":
             guard let a = req["account"] as? String else { throw SynthError(msg: "account is required") }
             return ["ok": true, "result": try mailRecent(account: a, limit: (req["limit"] as? Int) ?? 25)]
@@ -688,31 +716,113 @@ func encode(_ obj: [String: Any]) -> String {
     return s
 }
 
-// MARK: - change observer
+// MARK: - change queue and watchers
+//
+// Everything that can tell us "something moved" funnels into one JSONL queue. The queue
+// records *what* changed and nothing more; deciding whether it matters is the reactor's job,
+// which keeps detection free of model calls.
 
-final class ChangeObserver {
-    let path: String
-    init(queuePath: String) {
-        self.path = queuePath
-        NotificationCenter.default.addObserver(
-            forName: .EKEventStoreChanged, object: store, queue: nil
-        ) { [weak self] _ in self?.record() }
+var changeQueuePath = ""
+let changeQueueLock = NSLock()
+
+func appendChange(kind: String, detail: String = "") {
+    guard !changeQueuePath.isEmpty else { return }
+    let line = encode(["at": iso.string(from: Date()), "kind": kind, "detail": detail]) + "\n"
+    guard let data = line.data(using: .utf8) else { return }
+    changeQueueLock.lock()
+    defer { changeQueueLock.unlock() }
+    if !FileManager.default.fileExists(atPath: changeQueuePath) {
+        FileManager.default.createFile(atPath: changeQueuePath, contents: nil)
     }
-    func record() {
-        let line = encode([
-            "at": iso.string(from: Date()),
-            "kind": "eventkit_changed",
-        ]) + "\n"
-        guard let data = line.data(using: .utf8) else { return }
-        if !FileManager.default.fileExists(atPath: path) {
-            FileManager.default.createFile(atPath: path, contents: nil)
-        }
-        if let fh = FileHandle(forWritingAtPath: path) {
-            fh.seekToEndOfFile()
-            fh.write(data)
-            try? fh.close()
+    if let fh = FileHandle(forWritingAtPath: changeQueuePath) {
+        fh.seekToEndOfFile()
+        fh.write(data)
+        try? fh.close()
+    }
+}
+
+func installEventKitObserver() {
+    NotificationCenter.default.addObserver(
+        forName: .EKEventStoreChanged, object: store, queue: nil
+    ) { _ in
+        appendChange(kind: "eventkit_changed")
+    }
+}
+
+/// FSEvents callback is a C function pointer and cannot capture, so the mapping from path
+/// prefix to change kind is resolved here from globals.
+var watchRoots: [(prefix: String, kind: String)] = []
+
+func kindForPath(_ path: String) -> String? {
+    for (prefix, kind) in watchRoots where path.hasPrefix(prefix) {
+        return kind
+    }
+    return nil
+}
+
+let fsCallback: FSEventStreamCallback = { _, _, numEvents, eventPaths, _, _ in
+    // With kFSEventStreamCreateFlagUseCFTypes this is a CFArray of CFString.
+    guard let paths = unsafeBitCast(eventPaths, to: NSArray.self) as? [String] else { return }
+    var seen = Set<String>()
+    for i in 0..<min(numEvents, paths.count) {
+        guard let kind = kindForPath(paths[i]) else { continue }
+        if seen.insert(kind).inserted {
+            appendChange(kind: kind, detail: paths[i])
         }
     }
+}
+
+func installFileWatchers() {
+    let home = FileManager.default.homeDirectoryForCurrentUser.path
+    let candidates: [(String, String)] = [
+        ("\(home)/Library/Mail", "mail_changed"),
+        ("\(home)/Library/Group Containers/group.com.apple.notes", "notes_changed"),
+        ("\(home)/Library/Mobile Documents/com~apple~CloudDocs/Documents", "documents_changed"),
+    ]
+    var paths: [String] = []
+    for (path, kind) in candidates where FileManager.default.fileExists(atPath: path) {
+        watchRoots.append((path, kind))
+        paths.append(path)
+    }
+    guard !paths.isEmpty else {
+        FileHandle.standardError.write("no watchable paths found\n".data(using: .utf8)!)
+        return
+    }
+    var context = FSEventStreamContext(version: 0, info: nil, retain: nil, release: nil, copyDescription: nil)
+    guard let stream = FSEventStreamCreate(
+        kCFAllocatorDefault, fsCallback, &context, paths as CFArray,
+        FSEventStreamEventId(kFSEventStreamEventIdSinceNow),
+        2.0,  // coalesce bursts inside the stream itself
+        FSEventStreamCreateFlags(kFSEventStreamCreateFlagNoDefer | kFSEventStreamCreateFlagUseCFTypes)
+    ) else {
+        FileHandle.standardError.write("FSEventStreamCreate failed\n".data(using: .utf8)!)
+        return
+    }
+    FSEventStreamSetDispatchQueue(stream, DispatchQueue.main)
+    FSEventStreamStart(stream)
+    FileHandle.standardError.write("watching \(paths.count) paths\n".data(using: .utf8)!)
+}
+
+/// Reports whether the daemon can actually reach TCC-protected locations, so a missing
+/// Full Disk Access grant surfaces as a diagnostic instead of as mysterious empty results.
+func diag() -> [String: Any] {
+    let home = FileManager.default.homeDirectoryForCurrentUser.path
+    var out: [String: Any] = [:]
+    for (label, path) in [
+        ("mail", "\(home)/Library/Mail"),
+        ("notes", "\(home)/Library/Group Containers/group.com.apple.notes"),
+        ("documents", "\(home)/Library/Mobile Documents/com~apple~CloudDocs/Documents"),
+    ] {
+        do {
+            let entries = try FileManager.default.contentsOfDirectory(atPath: path)
+            out[label] = ["readable": true, "entries": entries.count]
+        } catch {
+            out[label] = ["readable": false, "error": "\(error.localizedDescription)"]
+        }
+    }
+    out["watching"] = watchRoots.map { $0.kind }
+    out["queue"] = changeQueuePath
+    return out
 }
 
 // MARK: - unix socket server
@@ -746,7 +856,9 @@ func serve(socketPath: String, queuePath: String) -> Never {
     // Warm the grants while we are still the responsible process.
     requestAccess(.event)
     requestAccess(.reminder)
-    _ = ChangeObserver(queuePath: queuePath)
+    changeQueuePath = queuePath
+    installEventKitObserver()
+    installFileWatchers()
 
     let q = DispatchQueue(label: "page.akvaithi.synth.accept")
     q.async {
