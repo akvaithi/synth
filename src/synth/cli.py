@@ -5,6 +5,7 @@
     synth brief morning  write a brief
     synth index          load extracted document text into the searchable index
     synth ocr            OCR the scanned PDFs that had no text layer
+    synth enrich         extract structured facts from the curated documents
     synth notes          re-render the Notes mirror
     synth log            what Synth has done
     synth why <id>       why it did one thing
@@ -74,6 +75,22 @@ def cmd_ocr(args):
     return 0
 
 
+def cmd_enrich(args):
+    from synth import enrich
+    conn = db.connect()
+    dry = "--dry-run" in args
+    extra = 0
+    for a in args:
+        if a.startswith("--extra="):
+            extra = int(a.split("=", 1)[1])
+    docs = enrich.select(conn, extra_limit=extra)
+    print(f"{len(docs)} document(s) selected for extraction")
+    results = enrich.run(conn, docs, dry_run=dry)
+    print(json.dumps({"batches": len(results),
+                      "errors": sum(1 for r in results if r.get("error"))}, indent=2))
+    return 0
+
+
 def cmd_notes(args):
     from synth import notes_sync
     conn = db.connect()
@@ -131,7 +148,7 @@ def cmd_status(args):
 
 COMMANDS = {
     "watch": cmd_watch, "react": cmd_react, "brief": cmd_brief, "index": cmd_index,
-    "ocr": cmd_ocr, "notes": cmd_notes, "log": cmd_log, "why": cmd_why,
+    "ocr": cmd_ocr, "enrich": cmd_enrich, "notes": cmd_notes, "log": cmd_log, "why": cmd_why,
     "undo": cmd_undo, "status": cmd_status,
 }
 
