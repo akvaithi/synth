@@ -148,6 +148,33 @@ def add_facts(conn, payload: dict, source_kind: str = "conversation",
     return facts.ingest_batch(conn, payload, source_id=sid, mail_derived=mail_derived)
 
 
+def import_reminders(conn, run_id=None) -> dict:
+    """Record existing reminders as obligations, linked by EventKit identifier.
+
+    This creates nothing in Reminders — it joins what is already there to the database, so
+    that obligations and the reminders Arun actually looks at are the same objects. Matching
+    to entities is left to a later pass; the link itself is what matters.
+    """
+    existing = {r["ek_identifier"] for r in conn.execute(
+        "SELECT ek_identifier FROM obligation WHERE ek_identifier IS NOT NULL")}
+    added = 0
+    for r in call("reminders", timeout=300):
+        if r["id"] in existing:
+            continue
+        conn.execute(
+            "INSERT INTO obligation (title, due, status, ek_identifier, ek_kind, "
+            "externally_set) VALUES (?,?,?,?,'reminder',0) "
+            "ON CONFLICT (ek_identifier) DO NOTHING",
+            (r["title"], r["due"] or None, "open", r["id"]))
+        added += 1
+    conn.commit()
+    if added:
+        db.log_action(conn, "import_reminders", "db",
+                      f"link {added} existing reminder(s) to obligations by identifier",
+                      run_id=run_id, after={"count": added})
+    return {"imported": added, "already_linked": len(existing)}
+
+
 def create_reminder(conn, title: str, reason: str, due: str = None, list: str = None,
                     notes: str = None, entity: str = None, externally_set: bool = False,
                     run_id=None, evidence_id=None) -> dict:
