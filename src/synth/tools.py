@@ -264,6 +264,40 @@ def update_obligation(conn, ek_identifier: str, reason: str, externally_set: boo
     return {"action_id": action_id, "changed": True}
 
 
+def read_note(conn, doc: str = "", note_id: str = "") -> dict:
+    """Read a note's current body — the channel for corrections Arun types into the mirror."""
+    from synth.notes_sync import html_to_text
+    if doc and not note_id:
+        row = conn.execute("SELECT note_id FROM notes_mirror WHERE doc = ?", (doc,)).fetchone()
+        if row is None or not row["note_id"]:
+            return {"found": False, "doc": doc}
+        note_id = row["note_id"]
+    if not note_id:
+        return {"found": False, "error": "doc or note_id is required"}
+    n = call("notes_get", id=note_id, timeout=180)
+    return {"found": True, "id": note_id, "name": n.get("name"),
+            "text": html_to_text(n.get("body", ""))}
+
+
+def accept_correction(conn, doc: str, reason: str, run_id=None) -> dict:
+    """Mark a note's correction as read, so the mirror stops holding and re-renders.
+
+    Call this only after the correction has actually been recorded with add_facts.
+    """
+    row = conn.execute("SELECT note_id FROM notes_mirror WHERE doc = ?", (doc,)).fetchone()
+    if row is None:
+        raise ValueError(f"no mirrored note for {doc!r}")
+    n = call("notes_get", id=row["note_id"], timeout=180)
+    from synth.notes_sync import html_to_text
+    h = db.text_hash(html_to_text(n.get("body", "")))
+    conn.execute("UPDATE notes_mirror SET last_written_hash = ?, last_seen_hash = ? "
+                 "WHERE doc = ?", (h, h, doc))
+    db.log_action(conn, "accept_correction", "note", reason, run_id=run_id,
+                  target_id=row["note_id"])
+    conn.commit()
+    return {"doc": doc, "accepted": True}
+
+
 def mail_links(conn, account: str, index: int, messageId: str, mailbox: str = "INBOX") -> dict:
     """Destination URLs and their anchor text, parsed from the message's HTML part."""
     from synth import maillinks

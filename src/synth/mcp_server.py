@@ -141,6 +141,22 @@ def complete_reminder(ek_identifier: str, reason: str, evidence_source: str = ""
         evidence_source=evidence_source or None)))
 
 
+def read_note(doc: str = "", note_id: str = "") -> str:
+    """Read a mirrored note's current text. This is how corrections Arun types into the
+    Synth folder in Notes reach you. doc is one of: brief, obligations, programs, people,
+    activity."""
+    return _j(_with_conn(lambda c: tools.read_note(c, doc, note_id)))
+
+
+def accept_correction(doc: str, reason: str) -> str:
+    """Mark a note's correction as read so the mirror resumes re-rendering it.
+
+    Call this ONLY after you have recorded the correction with add_facts. Until you do, the
+    mirror deliberately refuses to overwrite the note, because re-rendering over an unread
+    correction destroys the very thing it was for."""
+    return _j(_with_conn(lambda c: tools.accept_correction(c, doc, reason)))
+
+
 def mail_links(account: str, index: int, messageId: str, mailbox: str = "INBOX") -> str:
     """Destination URLs and anchor text from one message.
 
@@ -187,9 +203,9 @@ def undo(action_id: int) -> str:
 
 
 READ_TOOLS = [search_context, get_entity, fact_history, list_obligations, read_document,
-              today, activity, why, mail_recent, mail_read, mail_attachments, mail_links]
+              today, activity, why, mail_recent, mail_read, mail_attachments, mail_links, read_note]
 WRITE_TOOLS = [add_facts, create_reminder, complete_reminder, update_reminder,
-               update_obligation, draft_email, undo]
+               update_obligation, draft_email, accept_correction, undo]
 
 
 def build(name: str = "synth", writable: bool = True) -> MCPServer:

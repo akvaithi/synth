@@ -21,7 +21,7 @@ REACTOR_TOOLS = [
     "mcp__synth__list_obligations", "mcp__synth__read_document", "mcp__synth__today",
     "mcp__synth__activity", "mcp__synth__why", "mcp__synth__mail_recent",
     "mcp__synth__mail_read", "mcp__synth__mail_attachments",
-    "mcp__synth__mail_links",
+    "mcp__synth__mail_links", "mcp__synth__read_note", "mcp__synth__accept_correction",
     "mcp__synth__add_facts", "mcp__synth__create_reminder",
     "mcp__synth__complete_reminder", "mcp__synth__update_reminder",
     "mcp__synth__update_obligation", "mcp__synth__draft_email",
@@ -31,7 +31,7 @@ REACTOR_TOOLS = [
 ]
 BRIEF_TOOLS = [t for t in REACTOR_TOOLS if not t.endswith(
     ("create_reminder", "complete_reminder", "update_reminder", "update_obligation",
-     "draft_email", "add_facts"))]
+     "draft_email", "add_facts", "accept_correction"))]
 
 
 def _prompt(name: str, **fmt) -> str:

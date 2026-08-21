@@ -7,6 +7,7 @@
     synth ocr            OCR the scanned PDFs that had no text layer
     synth enrich         extract structured facts from the curated documents
     synth notes          re-render the Notes mirror
+    synth reconcile      align stored note hashes with what Notes actually holds
     synth log            what Synth has done
     synth why <id>       why it did one thing
     synth undo <id>      reverse one action
@@ -99,6 +100,14 @@ def cmd_notes(args):
     return 0
 
 
+def cmd_reconcile(args):
+    from synth import notes_sync
+    conn = db.connect()
+    print(json.dumps(notes_sync.reconcile(conn), indent=2))
+    print("pending after:", notes_sync.pending_corrections(conn))
+    return 0
+
+
 def cmd_log(args):
     from synth import tools
     conn = db.connect()
@@ -148,7 +157,7 @@ def cmd_status(args):
 
 COMMANDS = {
     "watch": cmd_watch, "react": cmd_react, "brief": cmd_brief, "index": cmd_index,
-    "ocr": cmd_ocr, "enrich": cmd_enrich, "notes": cmd_notes, "log": cmd_log, "why": cmd_why,
+    "ocr": cmd_ocr, "enrich": cmd_enrich, "notes": cmd_notes, "reconcile": cmd_reconcile, "log": cmd_log, "why": cmd_why,
     "undo": cmd_undo, "status": cmd_status,
 }
 

@@ -153,6 +153,39 @@ DOCS = {
 # ---------------------------------------------------------------- sync
 
 
+def reconcile(conn) -> dict:
+    """Align stored hashes with what Notes actually holds.
+
+    Needed because Notes rewrites HTML on save: the hash of what Synth sent never equals the
+    hash of what Notes stored, so without this every note reads as edited forever and the
+    mirror holds on phantom corrections. Only safe to call when you know the divergence is
+    formatting rather than a real edit.
+    """
+    hashes = live_hashes()
+    out = {}
+    for row in conn.execute("SELECT doc, note_id FROM notes_mirror WHERE note_id IS NOT NULL"):
+        h = hashes.get(row["note_id"])
+        if h is None:
+            out[row["doc"]] = "not found in folder"
+            continue
+        conn.execute("UPDATE notes_mirror SET last_written_hash = ?, last_seen_hash = ? "
+                     "WHERE doc = ?", (h, h, row["doc"]))
+        out[row["doc"]] = "reconciled"
+    conn.commit()
+    return out
+
+
+def live_hashes() -> dict[str, str]:
+    """Hash every note in the mirror folder, read through notes_dump.
+
+    notes_get and notes_dump return subtly different HTML for the same note, so hashing one
+    and comparing against the other marks every note as edited. The watcher uses dump, so
+    dump is the single source of truth for hashing.
+    """
+    return {n["id"]: db.text_hash(n["body"])
+            for n in call("notes_dump", folder=config.NOTES_FOLDER, timeout=300)}
+
+
 def pending_corrections(conn) -> list[dict]:
     rows = conn.execute(
         "SELECT doc, note_id, note_name, last_edit_at FROM notes_mirror "
@@ -167,6 +200,9 @@ def render(conn, doc: str, run_id=None, force: bool = False) -> str:
 
     title, blocks = DOCS[doc](conn)
     body = to_html(title, blocks)
+    # Provisional. Notes rewrites HTML on save, so the hash of what we send never matches
+    # what it stores -- which made every note look permanently edited and would have broken
+    # the correction flow entirely. The authoritative hash is read back after writing.
     new_hash = db.text_hash(html_to_text(body))
 
     row = conn.execute("SELECT * FROM notes_mirror WHERE doc = ?", (doc,)).fetchone()
@@ -186,6 +222,12 @@ def render(conn, doc: str, run_id=None, force: bool = False) -> str:
         note_id = created["id"]
         db.log_action(conn, "notes_create", "note", f"create {doc} mirror note",
                       run_id=run_id, target_id=note_id, after={"id": note_id, "doc": doc})
+
+    # Read back what Notes actually stored, through the same path the watcher uses.
+    try:
+        new_hash = live_hashes().get(note_id, new_hash)
+    except Exception:
+        pass  # keep the provisional hash; reconcile will settle it
 
     conn.execute(
         "INSERT INTO notes_mirror (doc, note_id, note_name, last_written_hash, "
