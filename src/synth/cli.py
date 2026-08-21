@@ -104,7 +104,7 @@ def cmd_log(args):
     conn = db.connect()
     for r in tools.activity(conn, int(args[0]) if args else 30):
         flag = "  [UNDONE]" if r["undone_at"] else ""
-        print(f"{r['id']:>5}  {r['at'][:16]}  {r['action']:<20} {r['reason'][:70]}{flag}")
+        print(f"{r['id']:>5}  {db.local(r['at'])}  {r['action']:<20} {r['reason'][:70]}{flag}")
     return 0
 
 
@@ -141,7 +141,7 @@ def cmd_status(args):
     print("runs")
     for r in conn.execute("SELECT job, status, started_at, summary FROM run_log "
                           "ORDER BY id DESC LIMIT 5"):
-        print(f"    {r['started_at'][:16]}  {r['job']:<12} {r['status']:<6} "
+        print(f"    {db.local(r['started_at'])}  {r['job']:<12} {r['status']:<6} "
               f"{(r['summary'] or '')[:60]}")
     return 0
 

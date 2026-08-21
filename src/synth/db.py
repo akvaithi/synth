@@ -17,6 +17,26 @@ def now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def local(ts: str | None, fmt: str = "%Y-%m-%d %H:%M") -> str:
+    """Render a stored timestamp in local time.
+
+    Everything is stored in UTC — SQLite's datetime('now') is UTC, and now() is explicit
+    about it — but every human-facing surface must show local time. On a system whose whole
+    job is deadlines, showing a UTC timestamp as if it were local is a real error, not a
+    cosmetic one.
+    """
+    if not ts:
+        return ""
+    text = ts.strip().replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError:
+        return ts
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone().strftime(fmt)
+
+
 def text_hash(s: str) -> str:
     """Hash of normalised text: whitespace-collapsed, so trivial reflow is not an edit."""
     normalised = " ".join(s.split())

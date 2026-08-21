@@ -109,7 +109,7 @@ def doc_recent_actions(conn) -> tuple[str, list]:
     ).fetchall()
     blocks = [("p", "What Synth has done, newest first. Nothing here is hidden from you.")]
     blocks.append(("ul", [
-        f"{r['at'][:16]} — {r['action']} ({r['target_kind']}): {r['reason']}"
+        f"{db.local(r['at'])} — {r['action']} ({r['target_kind']}): {r['reason']}"
         + ("  [UNDONE]" if r["undone_at"] else "") for r in rows]))
     return "Synth — Activity", blocks
 
