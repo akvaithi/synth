@@ -1115,21 +1115,38 @@ func serve(socketPath: String, queuePath: String) -> Never {
         while true {
             let client = Darwin.accept(fd, nil, nil)
             if client < 0 { continue }
+
+            // Read until EOF. A single read() returns only what is currently buffered, so a
+            // request larger than one chunk -- a rendered Notes document, for instance --
+            // arrived truncated and the client saw a broken pipe. The client half-closes
+            // after writing, which is what ends this loop.
+            var request = Data()
             var buf = [UInt8](repeating: 0, count: 65536)
-            let n = Darwin.read(client, &buf, buf.count)
-            var response: [String: Any]
-            if n <= 0 {
-                response = ["ok": false, "error": "empty request"]
-            } else {
-                let data = Data(buf[0..<n])
-                if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                    response = handle(obj)
-                } else {
-                    response = ["ok": false, "error": "malformed json request"]
-                }
+            while true {
+                let n = Darwin.read(client, &buf, buf.count)
+                if n <= 0 { break }
+                request.append(contentsOf: buf[0..<n])
             }
-            var out = Array((encode(response) + "\n").utf8)
-            _ = Darwin.write(client, &out, out.count)
+
+            var response: [String: Any]
+            if request.isEmpty {
+                response = ["ok": false, "error": "empty request"]
+            } else if let obj = try? JSONSerialization.jsonObject(with: request) as? [String: Any] {
+                response = handle(obj)
+            } else {
+                response = ["ok": false, "error": "malformed json request"]
+            }
+
+            // Write fully: a large response will not go out in one call either.
+            let out = Array((encode(response) + "\n").utf8)
+            var written = 0
+            while written < out.count {
+                let n = out.withUnsafeBufferPointer { p -> Int in
+                    Darwin.write(client, p.baseAddress! + written, out.count - written)
+                }
+                if n <= 0 { break }
+                written += n
+            }
             Darwin.close(client)
         }
     }
