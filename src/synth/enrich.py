@@ -26,6 +26,11 @@ PRIORITY_PATTERNS = [
     ("degree-eval", "%DEGREE-EVAL%"),
 ]
 
+# Paths that match a priority pattern but are not *about* Arun -- generic workshop decks,
+# bookmarks, other people's application material kept as writing samples.
+EXCLUDE_SUBSTRINGS = ["Workshop", "Career Center", ".url", "other students",
+                      "Goldwater Examples", "Sample"]
+
 ENRICH_TOOLS = [
     "mcp__synth__search_context", "mcp__synth__get_entity", "mcp__synth__read_document",
     "mcp__synth__fact_history", "mcp__synth__add_facts",
@@ -40,7 +45,9 @@ def select(conn, extra_limit: int = 0) -> list[dict]:
             "SELECT id, path, title, chars FROM document WHERE path LIKE ? "
             "ORDER BY chars DESC", (pattern,)
         ):
-            if r["id"] in seen or r["chars"] < 40:
+            if r["id"] in seen or r["chars"] < 200:
+                continue
+            if any(x.lower() in r["path"].lower() for x in EXCLUDE_SUBSTRINGS):
                 continue
             seen.add(r["id"])
             chosen.append({"id": r["id"], "path": r["path"], "chars": r["chars"],
