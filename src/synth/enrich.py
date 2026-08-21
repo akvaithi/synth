@@ -39,7 +39,8 @@ ENRICH_TOOLS = [
 
 def select(conn, extra_limit: int = 0) -> list[dict]:
     """The curated set: Consort's distilled context first, then degree and record material."""
-    seen, chosen = set(), []
+    done = {r[0] for r in conn.execute("SELECT document_id FROM enrichment")}
+    seen, chosen = set(done), []
     for label, pattern in PRIORITY_PATTERNS:
         for r in conn.execute(
             "SELECT id, path, title, chars FROM document WHERE path LIKE ? "
@@ -83,7 +84,7 @@ def run(conn, docs: list[dict], dry_run: bool = False) -> list[dict]:
     groups = batches(docs)
     for i, group in enumerate(groups, 1):
         listing = "\n".join(
-            f"- id {d['id']}  ({d['chars']:,} chars)  {d['path']}" for d in group)
+            f"- document_id {d['id']}  ({d['chars']:,} chars)  {d['path']}" for d in group)
         print(f"[{i}/{len(groups)}] {len(group)} document(s), "
               f"{sum(d['chars'] for d in group):,} chars", flush=True)
         if dry_run:
@@ -94,6 +95,10 @@ def run(conn, docs: list[dict], dry_run: bool = False) -> list[dict]:
             res = reactor.run_claude(prompt, ENRICH_TOOLS, max_turns=60, timeout=2400)
             summary = str(res.get("result", ""))[:3000]
             conn.execute("UPDATE run_log SET summary = ? WHERE id = ?", (summary, run_id))
+            if not res.get("is_error"):
+                conn.executemany(
+                    "INSERT OR IGNORE INTO enrichment (document_id, run_id) VALUES (?,?)",
+                    [(d["id"], run_id) for d in group])
             conn.commit()
         print("   ", summary[:400].replace("\n", " "), flush=True)
         results.append({"batch": i, "docs": len(group), "summary": summary,

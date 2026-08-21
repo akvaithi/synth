@@ -100,7 +100,7 @@ def mail_attachments(account: str, index: int, messageId: str, mailbox: str = "I
 # ---------------------------------------------------------------- write tools
 
 
-def add_facts(payload: dict, source_ref: str = "interview") -> str:
+def add_facts(payload: dict, source_ref: str = "interview", document_id: int = 0) -> str:
     """Record facts in the context database.
 
     payload: {"entities":[{"kind","name","description","status",
@@ -110,8 +110,13 @@ def add_facts(payload: dict, source_ref: str = "interview") -> str:
 
     kind is one of person, org, program, course, application, project, award, topic.
     Facts are never overwritten — a changed value supersedes the old one and the history is
-    kept. Set confidence below 1.0 for anything inferred rather than stated outright."""
-    return _j(_with_conn(lambda c: tools.add_facts(c, payload, source_ref=source_ref)))
+    kept. Set confidence below 1.0 for anything inferred rather than stated outright.
+
+    When extracting from a document, ALWAYS pass document_id — the id you were given for
+    that document. It links every fact back to the file that stated it, which is what makes
+    provenance answerable later. One add_facts call per document."""
+    return _j(_with_conn(lambda c: tools.add_facts(
+        c, payload, source_ref=source_ref, document_id=document_id or None)))
 
 
 def create_reminder(title: str, reason: str, due: str = "", list: str = "",

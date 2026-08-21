@@ -43,8 +43,11 @@ def text_hash(s: str) -> str:
     return hashlib.sha256(normalised.encode("utf-8")).hexdigest()
 
 
-def connect(path: str = DB_PATH) -> sqlite3.Connection:
-    conn = sqlite3.connect(path, timeout=30.0)
+def connect(path: str = DB_PATH, timeout: float = 120.0) -> sqlite3.Connection:
+    # A long busy timeout matters: an OCR pass running alongside an enrichment pass held the
+    # write lock past 30s and killed the enrichment outright. Heavy writers should not be
+    # run concurrently, but the timeout should survive it if they are.
+    conn = sqlite3.connect(path, timeout=timeout)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     return conn

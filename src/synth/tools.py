@@ -133,8 +133,18 @@ def why(conn, action_id: int) -> dict:
 
 
 def add_facts(conn, payload: dict, source_kind: str = "conversation",
-              source_ref: str = "interview", mail_derived: bool = False) -> dict:
-    sid = db.upsert_source(conn, source_kind, source_ref)
+              source_ref: str = "interview", mail_derived: bool = False,
+              document_id: int | None = None) -> dict:
+    """Record facts. When they came from a document, pass document_id so the provenance
+    points at the file itself rather than at a generic 'conversation' source."""
+    if document_id:
+        row = conn.execute("SELECT source_id FROM document WHERE id = ?",
+                           (document_id,)).fetchone()
+        if row is None:
+            raise ValueError(f"no document {document_id}")
+        sid = row["source_id"]
+    else:
+        sid = db.upsert_source(conn, source_kind, source_ref)
     return facts.ingest_batch(conn, payload, source_id=sid, mail_derived=mail_derived)
 
 

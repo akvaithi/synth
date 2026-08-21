@@ -20,7 +20,8 @@ anything that is a draft of an opinion rather than a fact.
 
 ## How to record it
 
-- Use `add_facts`. One call per document is fine; batch related entities together.
+- Use `add_facts`, **one call per document**, always passing that document's `document_id`.
+  That is what links each fact back to the file that stated it.
 - **Entity names must be canonical and reusable.** "Goldwater Scholarship", not "the
   Goldwater". If an entity plausibly already exists, call `search_context` first and reuse
   the exact existing name, otherwise you will create duplicates that are painful to merge.

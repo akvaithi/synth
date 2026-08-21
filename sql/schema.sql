@@ -212,3 +212,13 @@ CREATE TRIGGER IF NOT EXISTS document_ad AFTER DELETE ON document BEGIN
     INSERT INTO document_fts (document_fts, rowid, title, text)
     VALUES ('delete', old.id, old.title, old.text);
 END;
+
+-- ---------------------------------------------------------------- enrichment tracking
+
+-- Which documents have already been through LLM extraction. Extraction is the expensive
+-- stage, so a re-run must resume rather than start over.
+CREATE TABLE IF NOT EXISTS enrichment (
+    document_id INTEGER PRIMARY KEY REFERENCES document(id),
+    run_id      INTEGER REFERENCES run_log(id),
+    at          TEXT NOT NULL DEFAULT (datetime('now'))
+);
