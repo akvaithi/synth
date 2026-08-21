@@ -21,11 +21,17 @@ REACTOR_TOOLS = [
     "mcp__synth__list_obligations", "mcp__synth__read_document", "mcp__synth__today",
     "mcp__synth__activity", "mcp__synth__why", "mcp__synth__mail_recent",
     "mcp__synth__mail_read", "mcp__synth__mail_attachments",
+    "mcp__synth__mail_links",
     "mcp__synth__add_facts", "mcp__synth__create_reminder",
-    "mcp__synth__complete_reminder", "mcp__synth__draft_email",
+    "mcp__synth__complete_reminder", "mcp__synth__update_reminder",
+    "mcp__synth__update_obligation", "mcp__synth__draft_email",
+    # Arun asked for certainty over speed, and four recorded deadlines are explicitly
+    # unverified. Without these, "verify against the source" is not a thing Synth can do.
+    "WebSearch", "WebFetch",
 ]
 BRIEF_TOOLS = [t for t in REACTOR_TOOLS if not t.endswith(
-    ("create_reminder", "complete_reminder", "draft_email", "add_facts"))]
+    ("create_reminder", "complete_reminder", "update_reminder", "update_obligation",
+     "draft_email", "add_facts"))]
 
 
 def _prompt(name: str, **fmt) -> str:
@@ -111,4 +117,12 @@ def brief(conn, when: str = "morning") -> dict:
         conn.execute("UPDATE run_log SET summary = ? WHERE id = ?",
                      (str(result.get("result", ""))[:4000], run_id))
         conn.commit()
+        if not result.get("is_error"):
+            from synth import notes_sync
+            try:
+                notes_sync.render(conn, "brief", run_id=run_id)
+            except Exception as e:  # a delivery failure must not lose the brief
+                conn.execute("UPDATE run_log SET detail = ? WHERE id = ?",
+                             (f"brief written but Notes delivery failed: {e}", run_id))
+                conn.commit()
     return result

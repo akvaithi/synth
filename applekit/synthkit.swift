@@ -504,6 +504,35 @@ func messageRef(account: String, mailbox: String, index: Int) -> String {
     """
 }
 
+/// Raw RFC822 source of one message.
+///
+/// `content of message` returns Mail's plain-text rendering, which drops every hyperlink —
+/// so an opportunity email arrives with the prose but not the URL, which is exactly the
+/// friction Synth exists to remove. The raw source keeps the HTML part, and the hrefs with it.
+func mailSource(account: String, mailbox: String, index: Int, expectId: String,
+                maxBytes: Int) throws -> [String: Any] {
+    let src = """
+    tell application "Mail"
+        \(messageRef(account: account, mailbox: mailbox, index: index))
+        set actualId to message id of m
+        if actualId is not \(asQuote(expectId)) then return "MISMATCH"
+        with timeout of 600 seconds
+            set s to source of m
+        end timeout
+        return s
+    end tell
+    """
+    let raw = try runAppleScript(src)
+    if raw == "MISMATCH" { throw SynthError(msg: "index no longer points at \(expectId)") }
+    let truncated = raw.count > maxBytes
+    return [
+        "messageId": expectId,
+        "source": truncated ? String(raw.prefix(maxBytes)) : raw,
+        "truncated": truncated,
+        "bytes": raw.count,
+    ]
+}
+
 func mailAttachments(account: String, mailbox: String, index: Int, expectId: String) throws -> [String: Any] {
     let src = """
     tell application "Mail"
@@ -908,6 +937,14 @@ func handle(_ req: [String: Any]) -> [String: Any] {
             return ["ok": true, "result": try mailAttachments(
                 account: a, mailbox: (req["mailbox"] as? String) ?? "INBOX",
                 index: idx, expectId: mid)]
+        case "mail_source":
+            guard let a = req["account"] as? String, let idx = req["index"] as? Int,
+                  let mid = req["messageId"] as? String else {
+                throw SynthError(msg: "account, index and messageId are required")
+            }
+            return ["ok": true, "result": try mailSource(
+                account: a, mailbox: (req["mailbox"] as? String) ?? "INBOX",
+                index: idx, expectId: mid, maxBytes: (req["maxBytes"] as? Int) ?? 400000)]
         case "mail_get_at":
             guard let a = req["account"] as? String, let idx = req["index"] as? Int,
                   let mid = req["messageId"] as? String else {

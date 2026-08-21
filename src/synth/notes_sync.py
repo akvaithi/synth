@@ -114,7 +114,35 @@ def doc_recent_actions(conn) -> tuple[str, list]:
     return "Synth — Activity", blocks
 
 
+def doc_brief(conn) -> tuple[str, list]:
+    """The latest brief, rendered where Arun will actually read it.
+
+    Until Remote Control is connected there is no push channel, so the Notes mirror is the
+    delivery mechanism, not merely an archive.
+    """
+    row = conn.execute(
+        "SELECT trigger, started_at, summary FROM run_log WHERE job = 'brief' "
+        "AND status = 'ok' AND summary IS NOT NULL ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    if row is None:
+        return "Synth — Brief", [("p", "No brief has run yet.")]
+    blocks = [("p", f"{row['trigger']} brief — {db.local(row['started_at'])}"), ("p", "")]
+    for para in (row["summary"] or "").split("\n"):
+        text = para.rstrip()
+        if not text:
+            continue
+        stripped = text.lstrip("#").strip()
+        if text.startswith("#"):
+            blocks.append(("h", stripped))
+        elif text.lstrip().startswith(("- ", "* ")):
+            blocks.append(("ul", [text.lstrip()[2:]]))
+        else:
+            blocks.append(("p", text))
+    return "Synth — Brief", blocks
+
+
 DOCS = {
+    "brief": doc_brief,
     "obligations": doc_obligations,
     "programs": doc_programs,
     "people": doc_people,

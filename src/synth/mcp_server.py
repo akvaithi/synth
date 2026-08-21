@@ -141,6 +141,38 @@ def complete_reminder(ek_identifier: str, reason: str, evidence_source: str = ""
         evidence_source=evidence_source or None)))
 
 
+def mail_links(account: str, index: int, messageId: str, mailbox: str = "INBOX") -> str:
+    """Destination URLs and anchor text from one message.
+
+    ALWAYS use this for anything carrying an opportunity. mail_read returns Mail's plain-text
+    rendering with every hyperlink stripped, so the prose survives and the link does not.
+    Arun should never have to reopen an email to reach a posting, portal or form."""
+    return _j(_with_conn(lambda c: tools.mail_links(c, account, index, messageId, mailbox)))
+
+
+def update_reminder(ek_identifier: str, reason: str, due: str = "", title: str = "",
+                    notes: str = "", list: str = "") -> str:
+    """Edit an existing reminder. Partial — a field you do not name is never cleared.
+
+    Use this to give a date-only reminder a time: an untimed reminder never appears in
+    Calendar, and Arun reads his day from Calendar."""
+    fields = {k: v for k, v in
+              (("due", due), ("title", title), ("notes", notes), ("list", list)) if v}
+    return _j(_with_conn(lambda c: tools.update_reminder(
+        c, ek_identifier=ek_identifier, reason=reason, **fields)))
+
+
+def update_obligation(ek_identifier: str, reason: str, externally_set: bool = None,
+                      entity: str = "", status: str = "") -> str:
+    """Correct an obligation's metadata without touching the reminder.
+
+    Set externally_set true only for a genuine external deadline — one someone else imposed
+    with a consequence — and false for a target Arun chose himself."""
+    return _j(_with_conn(lambda c: tools.update_obligation(
+        c, ek_identifier=ek_identifier, reason=reason, externally_set=externally_set,
+        entity=entity or None, status=status or None)))
+
+
 def draft_email(to: list[str], subject: str, body: str, reason: str,
                 account: str = "Work") -> str:
     """Write an email draft into Mail. It is saved, never sent — there is no send path and
@@ -155,8 +187,9 @@ def undo(action_id: int) -> str:
 
 
 READ_TOOLS = [search_context, get_entity, fact_history, list_obligations, read_document,
-              today, activity, why, mail_recent, mail_read, mail_attachments]
-WRITE_TOOLS = [add_facts, create_reminder, complete_reminder, draft_email, undo]
+              today, activity, why, mail_recent, mail_read, mail_attachments, mail_links]
+WRITE_TOOLS = [add_facts, create_reminder, complete_reminder, update_reminder,
+               update_obligation, draft_email, undo]
 
 
 def build(name: str = "synth", writable: bool = True) -> MCPServer:

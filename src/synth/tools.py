@@ -212,6 +212,64 @@ def complete_reminder(conn, ek_identifier: str, reason: str, evidence_source: st
     return {"action_id": action_id, "reminder": result.get("after")}
 
 
+def update_reminder(conn, ek_identifier: str, reason: str, run_id=None, **fields) -> dict:
+    """Edit an existing reminder. Partial: a field not named is never cleared.
+
+    The first brief could not fix three reminders that had a date but no time, because no
+    edit tool was exposed. An untimed reminder never appears in Calendar, which is where
+    Arun reads his day, so this matters more than it looks.
+    """
+    action_id, result = actions.update_reminder(
+        conn, id=ek_identifier, reason=reason, run_id=run_id, **fields)
+    after = result.get("after") or {}
+    if after.get("due"):
+        conn.execute("UPDATE obligation SET due = ?, updated_at = ? WHERE ek_identifier = ?",
+                     (after["due"], db.now(), ek_identifier))
+        conn.commit()
+    return {"action_id": action_id, "reminder": after}
+
+
+def update_obligation(conn, ek_identifier: str, reason: str, externally_set: bool = None,
+                      entity: str = None, status: str = None, run_id=None) -> dict:
+    """Correct an obligation's metadata: whether the deadline is externally imposed, which
+    entity it belongs to, its status. Does not touch the reminder itself."""
+    row = conn.execute("SELECT * FROM obligation WHERE ek_identifier = ?",
+                       (ek_identifier,)).fetchone()
+    if row is None:
+        raise ValueError(f"no obligation linked to {ek_identifier}")
+    before = dict(row)
+    sets, params = [], []
+    if externally_set is not None:
+        sets.append("externally_set = ?")
+        params.append(int(externally_set))
+    if status:
+        sets.append("status = ?")
+        params.append(status)
+    if entity:
+        er = conn.execute("SELECT id FROM entity WHERE name = ? COLLATE NOCASE",
+                          (entity,)).fetchone()
+        if er:
+            sets.append("entity_id = ?")
+            params.append(er["id"])
+    if not sets:
+        return {"changed": False}
+    params.extend([db.now(), ek_identifier])
+    conn.execute(f"UPDATE obligation SET {', '.join(sets)}, updated_at = ? "
+                 f"WHERE ek_identifier = ?", params)
+    action_id = db.log_action(conn, "update_obligation", "db", reason, run_id=run_id,
+                              target_id=ek_identifier, before=before,
+                              after={"externally_set": externally_set, "status": status,
+                                     "entity": entity})
+    conn.commit()
+    return {"action_id": action_id, "changed": True}
+
+
+def mail_links(conn, account: str, index: int, messageId: str, mailbox: str = "INBOX") -> dict:
+    """Destination URLs and their anchor text, parsed from the message's HTML part."""
+    from synth import maillinks
+    return maillinks.extract(account, index, messageId, mailbox=mailbox)
+
+
 def draft_email(conn, to: list[str], subject: str, body: str, reason: str,
                 account: str = "Work", run_id=None) -> dict:
     """Creates a draft. There is no send path and none may be added."""
