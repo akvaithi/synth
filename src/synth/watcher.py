@@ -76,7 +76,9 @@ def poll_mail(state: dict) -> list[dict]:
         # runs when the mailbox has actually moved.
         try:
             probe = call("mail_probe", account=account, timeout=240)
-        except SynthdError as e:
+        except Exception as e:
+            # Bare TimeoutError from the socket is not a SynthdError, and catching only the
+            # latter meant one slow call killed the whole detection pass.
             events.append({"kind": "mail_error", "account": account, "detail": str(e)})
             continue
         fingerprint = f"{probe['count']}:{probe['newestId']}"
@@ -86,7 +88,7 @@ def poll_mail(state: dict) -> list[dict]:
         try:
             msgs = call("mail_recent", account=account,
                         limit=config.MAIL_SCAN_LIMIT, timeout=300)
-        except SynthdError as e:
+        except Exception as e:
             events.append({"kind": "mail_error", "account": account, "detail": str(e)})
             continue
         known = set(seen.get(account, []))
@@ -106,7 +108,7 @@ def poll_notes(conn, state: dict) -> list[dict]:
     """A note whose live hash differs from what Synth last wrote is a correction from Arun."""
     try:
         notes = call("notes_dump", folder=config.NOTES_FOLDER, timeout=300)
-    except SynthdError as e:
+    except Exception as e:
         return [{"kind": "notes_error", "detail": str(e)}]
     events = []
     for n in notes:
@@ -181,10 +183,16 @@ def actionable(conn, events: list[dict]) -> list[dict]:
 
 
 def collect(conn) -> list[dict]:
+    """Run every detector, and let none of them take the others down with it."""
     state = _load(CURSOR, {})
-    events = drain_fsevents(state)
-    events += poll_mail(state)
-    events += poll_notes(conn, state)
+    events = []
+    for name, fn in (("fsevents", lambda: drain_fsevents(state)),
+                     ("mail", lambda: poll_mail(state)),
+                     ("notes", lambda: poll_notes(conn, state))):
+        try:
+            events += fn()
+        except Exception as e:
+            events.append({"kind": f"{name}_error", "detail": f"{type(e).__name__}: {e}"})
     _save(CURSOR, state)
     return events
 

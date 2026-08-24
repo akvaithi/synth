@@ -1,7 +1,13 @@
 """HTTP transport for the Claude app custom connector.
 
-Serves READ tools only — the write tools stay on the VM, reached through `synth call`, so a
-leaked endpoint can expose information but cannot act as Arun.
+Serves the FULL tool set — reads and writes — at Arun's request, so the Claude app can
+create reminders, draft email and record facts, not merely answer questions.
+
+The security consequence is real and worth stating plainly: the endpoint can now act as him,
+not just describe him. What stands between it and the internet is Cloudflare Access on
+/authorize plus this server's own OAuth, and the doctrine still holds inside the tools —
+there is no send path for email, and nothing deletes anything of his except a reminder Synth
+itself created.
 
 Auth is OAuth 2.1 with PKCE and Dynamic Client Registration, owned by this server, with
 Cloudflare Access in front as the identity provider. See auth.py for why Access alone is not
@@ -46,7 +52,7 @@ class BearerGate(BaseHTTPMiddleware):
 
 
 async def healthz(request):
-    return JSONResponse({"ok": True, "issuer": auth.ISSUER, "tools": "read-only"})
+    return JSONResponse({"ok": True, "issuer": auth.ISSUER, "tools": "read-write"})
 
 
 def app():
@@ -67,7 +73,7 @@ def app():
         allowed_hosts=hosts,
         allowed_origins=[auth.ISSUER, "https://claude.ai", "https://api.claude.ai"],
     )
-    application = build(name="synth", writable=False).streamable_http_app(
+    application = build(name="synth", writable=True).streamable_http_app(
         transport_security=security)
     application.router.routes[:0] = [
         Route("/.well-known/oauth-protected-resource", auth.protected_resource),

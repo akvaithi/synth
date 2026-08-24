@@ -130,7 +130,11 @@ GROUPS = {
 # Arun asked for ~2-minute reaction, and with FS noise triaged out the watcher rarely has
 # anything. This floor is a backstop against a pathological loop, not the normal cadence.
 MIN_SECONDS_BETWEEN_RUNS = int(os.environ.get("SYNTH_MIN_RUN_GAP", "180"))
-MAX_RUNS_PER_DAY = int(os.environ.get("SYNTH_MAX_RUNS_PER_DAY", "40"))
+# Triage is the real protection against a runaway -- FS noise no longer reaches this stage --
+# so this cap exists only as a last resort. Set too low, a past incident poisons the rolling
+# window and silently drops a day of legitimate work, which is exactly what happened on
+# 2026-08-24: 52 runs left over from the previous day's loop blocked every real reaction.
+MAX_RUNS_PER_DAY = int(os.environ.get("SYNTH_MAX_RUNS_PER_DAY", "150"))
 
 
 def rate_limited(conn) -> str | None:
@@ -152,7 +156,8 @@ def rate_limited(conn) -> str | None:
         "SELECT count(*) FROM run_log WHERE job = 'reactor' "
         "AND started_at >= datetime('now','-1 day')").fetchone()[0]
     if today >= MAX_RUNS_PER_DAY:
-        return f"{today} reactor runs in the last day; cap is {MAX_RUNS_PER_DAY}"
+        return (f"{today} reactor runs in the last day; cap is {MAX_RUNS_PER_DAY}. "
+                f"If this is unexpected, check for a detection loop rather than raising it.")
     return None
 
 

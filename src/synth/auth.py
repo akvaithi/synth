@@ -67,7 +67,7 @@ async def protected_resource(request: Request) -> Response:
         "resource": f"{ISSUER}/mcp",
         "authorization_servers": [ISSUER],
         "bearer_methods_supported": ["header"],
-        "scopes_supported": ["synth:read"],
+        "scopes_supported": ["synth:read", "synth:write"],
     })
 
 
@@ -81,7 +81,7 @@ async def authorization_server(request: Request) -> Response:
         "grant_types_supported": ["authorization_code", "refresh_token"],
         "code_challenge_methods_supported": ["S256"],
         "token_endpoint_auth_methods_supported": ["client_secret_post", "none"],
-        "scopes_supported": ["synth:read"],
+        "scopes_supported": ["synth:read", "synth:write"],
     })
 
 
@@ -181,7 +181,7 @@ async def token(request: Request) -> Response:
     conn.close()
     return JSONResponse({"access_token": access, "token_type": "Bearer",
                          "expires_in": int(TOKEN_TTL.total_seconds()),
-                         "scope": "synth:read"})
+                         "scope": "synth:read synth:write"})
 
 
 def valid_token(token_value: str) -> bool:

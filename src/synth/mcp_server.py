@@ -141,6 +141,54 @@ def complete_reminder(ek_identifier: str, reason: str, evidence_source: str = ""
         evidence_source=evidence_source or None)))
 
 
+def agenda(date: str) -> str:
+    """Everything already committed on one local day (YYYY-MM-DD): events and reminders.
+    Consult this before creating anything."""
+    return _j(_with_conn(lambda c: tools.agenda(c, date)))
+
+
+def already_scheduled(title: str, when: str, window_minutes: int = 240) -> str:
+    """Whether a commitment is ALREADY on the calendar or in reminders.
+
+    Call this before every create_reminder or event. Matching is on time proximity first,
+    because titles differ wildly for the same thing — "Dell Night 2026" and "Information
+    Session with Dell Technologies" are one commitment sharing one word. If it returns
+    matches, do nothing."""
+    return _j(_with_conn(lambda c: tools.already_scheduled(c, title, when, window_minutes)))
+
+
+def conflicts(start: str, minutes: int = 30) -> str:
+    """What overlaps a proposed time. Never schedule a reminder on top of a class."""
+    return _j(_with_conn(lambda c: tools.conflicts(c, start, minutes)))
+
+
+def free_slot(date: str, minutes: int = 30, earliest_hour: int = 8,
+              latest_hour: int = 21) -> str:
+    """First free slot on a day, avoiding events and other reminders."""
+    return _j(_with_conn(lambda c: tools.find_free_slot(c, date, minutes,
+                                                        earliest_hour, latest_hour)))
+
+
+def read_invitation(account: str, index: int, messageId: str, mailbox: str = "INBOX") -> str:
+    """Open a message's .ics invitation and check the calendar for it in one call.
+
+    A verdict of already_on_calendar means DO NOTHING. Assume web invitations were already
+    accepted even when the email claims otherwise."""
+    from synth import invites
+    return _j(_with_conn(lambda c: invites.read_invitation(c, account, index,
+                                                           messageId, mailbox)))
+
+
+def latest_brief() -> str:
+    """The most recent brief, verbatim."""
+    return _j(_with_conn(lambda c: tools.latest_brief(c)))
+
+
+def retract_reminder(ek_identifier: str, reason: str) -> str:
+    """Remove a reminder SYNTH created by mistake. Refused for anything Arun created."""
+    return _j(_with_conn(lambda c: tools.retract_reminder(c, ek_identifier, reason)))
+
+
 def read_note(doc: str = "", note_id: str = "") -> str:
     """Read a mirrored note's current text. This is how corrections Arun types into the
     Synth folder in Notes reach you. doc is one of: brief, obligations, programs, people,
@@ -203,13 +251,48 @@ def undo(action_id: int) -> str:
 
 
 READ_TOOLS = [search_context, get_entity, fact_history, list_obligations, read_document,
-              today, activity, why, mail_recent, mail_read, mail_attachments, mail_links, read_note]
+              today, activity, why, mail_recent, mail_read, mail_attachments, mail_links, read_note, agenda, already_scheduled,
+              conflicts, free_slot, read_invitation, latest_brief]
 WRITE_TOOLS = [add_facts, create_reminder, complete_reminder, update_reminder,
-               update_obligation, draft_email, accept_correction, undo]
+               update_obligation, draft_email, accept_correction, retract_reminder, undo]
+
+
+DOCTRINE_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__)))), "prompts", "doctrine.md")
+
+
+def _instructions(writable: bool) -> str:
+    """Ship the operating doctrine with the server.
+
+    The reactor gets these rules in its prompt; a client reaching in over MCP would not,
+    and would happily recreate the duplicate reminders and speculative follow-ups the rules
+    exist to prevent. The tool-calling section is stripped -- an MCP client calls tools
+    directly rather than through `synth call`.
+    """
+    try:
+        with open(DOCTRINE_PATH, encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        return "Synth: personal assistant over Arun Vaithianathan's context database."
+    out, skipping = [], False
+    for line in text.splitlines():
+        if line.startswith("## How you call things"):
+            skipping = True
+            continue
+        if skipping and line.startswith("## "):
+            skipping = False
+        if not skipping:
+            out.append(line)
+    body = "\n".join(out)
+    if not writable:
+        body += ("\n\n## This connection is read-only\n\n"
+                 "Only the read tools are available here. Do not promise to create, change "
+                 "or draft anything.")
+    return body
 
 
 def build(name: str = "synth", writable: bool = True) -> MCPServer:
-    server = MCPServer(name)
+    server = MCPServer(name, instructions=_instructions(writable))
     for fn in READ_TOOLS + (WRITE_TOOLS if writable else []):
         server.add_tool(fn)
     return server
