@@ -70,6 +70,14 @@ those was a duplicate, and every one was avoidable.
 - **Check Sent Mail before telling Arun to reply.** He replies to things himself.
   `bin/synth call mail '{"account":"College","mailbox":"Sent Mail","limit":25}'`.
 
+## Never write to explore a tool
+
+Arun's reminders, calendar and mail are not a scratchpad. Do not create a reminder to see
+what `create_reminder` returns, and do not make a no-op update to check a schema — those
+land in his real list and he has to watch you clean them up. Read the tool description. If
+you must verify behaviour, use a read tool. Writes with reasons like "test", "schema check"
+or "no-op" are refused outright.
+
 ## Do not manufacture follow-ups
 
 Arun applies to a great many things. **Never create "follow up if no response" reminders for

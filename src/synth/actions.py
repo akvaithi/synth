@@ -20,14 +20,27 @@ PLACEHOLDER_REASONS = {"test", "testing", "probe", "probing", "check", "checking
                        "example", "sample", "foo", "bar", "tmp", "temp", "n/a", "none"}
 
 
+# Markers of a write made to explore the tool rather than to help Arun. "test" alone is in
+# PLACEHOLDER_REASONS above rather than here, because a student legitimately has reasons like
+# "test results due Friday" -- these phrases do not appear in a real one.
+PROBE_MARKERS = ("schema", "no-op", "noop", "probing", "probe the", "placeholder",
+                 "dummy", "debug", "scratch", "ignore this")
+
+
 def _require_reason(reason: str) -> str:
     if not reason or not reason.strip():
         raise UnexplainedWrite("every Synth write must carry a reason")
     cleaned = reason.strip()
-    if cleaned.lower().rstrip(".!") in PLACEHOLDER_REASONS or len(cleaned) < 12:
+    lowered = cleaned.lower()
+    if lowered.rstrip(".!") in PLACEHOLDER_REASONS or len(cleaned) < 12:
         raise UnexplainedWrite(
             f"{cleaned!r} is not a reason. Say why this write helps Arun, in words he would "
-            f"understand months from now. Never create a real reminder to probe the API.")
+            f"understand months from now.")
+    if any(m in lowered for m in PROBE_MARKERS):
+        raise UnexplainedWrite(
+            f"{cleaned!r} reads as a write made to explore the tool, not to help Arun. "
+            f"Never write to his calendar, reminders or mail to check how a tool behaves — "
+            f"read the tool description, or exercise a read tool instead.")
     return cleaned
 
 

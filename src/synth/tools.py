@@ -322,9 +322,14 @@ def sync_obligations(conn, run_id=None) -> dict:
             reopened.append(o["title"])
     conn.commit()
     if completed or vanished or reopened:
+        # Name them in the reason itself. "9 completed by Arun" told the brief a number but
+        # not which, so it had to report that it could not say -- and Arun's standing rule is
+        # that nothing Synth does goes unnamed.
+        named = "; ".join(t[:48] for t in (completed + reopened)[:12])
         db.log_action(conn, "sync_obligations", "db",
                       f"reconciled against Reminders: {len(completed)} completed by Arun, "
-                      f"{len(vanished)} deleted, {len(reopened)} reopened",
+                      f"{len(vanished)} deleted, {len(reopened)} reopened"
+                      + (f" — {named}" if named else ""),
                       run_id=run_id,
                       after={"completed": completed, "vanished": vanished,
                              "reopened": reopened})
