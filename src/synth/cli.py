@@ -27,7 +27,7 @@ from synth import config, db
 def cmd_watch(args):
     from synth import reactor, watcher
     conn = db.connect()
-    events = watcher.collect(conn)
+    events = watcher.actionable(conn, watcher.collect(conn))
     pending = watcher.accumulate(events)
     if not watcher.due(pending):
         n = len(pending.get("events", []))
@@ -44,11 +44,11 @@ def cmd_react(args):
     from synth import reactor, watcher
     conn = db.connect()
     pending = watcher._load(watcher.PENDING, {"events": []})
-    events = pending.get("events") or watcher.collect(conn)
+    events = pending.get("events") or watcher.actionable(conn, watcher.collect(conn))
     if not events:
         print("nothing pending")
         return 0
-    result = reactor.react(conn, events)
+    result = reactor.react(conn, events, force="--force" in args)
     watcher.clear_pending()
     print(str(result.get("result", ""))[:4000])
     return 0

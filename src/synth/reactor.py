@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+from datetime import datetime, timezone
 
 from synth import db
 
@@ -120,11 +121,39 @@ def summarise_events(events: list[dict], cap: int = 60) -> str:
 
 
 GROUPS = {
-    "mail": {"mail_new", "mail_error"},
+    "mail": {"mail_new"},
     "schedule": {"eventkit_changed"},
-    "notes": {"note_edited", "notes_error"},
-    "files": {"documents_changed", "mail_changed", "notes_changed"},
+    "notes": {"note_edited"},
 }
+
+# A ceiling on how often the expensive stage may run, whatever the watcher thinks.
+# Arun asked for ~2-minute reaction, and with FS noise triaged out the watcher rarely has
+# anything. This floor is a backstop against a pathological loop, not the normal cadence.
+MIN_SECONDS_BETWEEN_RUNS = int(os.environ.get("SYNTH_MIN_RUN_GAP", "180"))
+MAX_RUNS_PER_DAY = int(os.environ.get("SYNTH_MAX_RUNS_PER_DAY", "40"))
+
+
+def rate_limited(conn) -> str | None:
+    """Why a run should not happen now, or None if it may proceed."""
+    row = conn.execute(
+        "SELECT started_at FROM run_log WHERE job = 'reactor' ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    if row:
+        try:
+            last = datetime.fromisoformat(row["started_at"].replace("Z", "+00:00"))
+            if last.tzinfo is None:
+                last = last.replace(tzinfo=timezone.utc)
+            gap = (datetime.now(timezone.utc) - last).total_seconds()
+            if gap < MIN_SECONDS_BETWEEN_RUNS:
+                return f"last reactor run was {int(gap)}s ago; minimum gap is {MIN_SECONDS_BETWEEN_RUNS}s"
+        except ValueError:
+            pass
+    today = conn.execute(
+        "SELECT count(*) FROM run_log WHERE job = 'reactor' "
+        "AND started_at >= datetime('now','-1 day')").fetchone()[0]
+    if today >= MAX_RUNS_PER_DAY:
+        return f"{today} reactor runs in the last day; cap is {MAX_RUNS_PER_DAY}"
+    return None
 
 
 def chunk(events: list[dict]) -> list[tuple[str, list[dict]]]:
@@ -147,8 +176,12 @@ def chunk(events: list[dict]) -> list[tuple[str, list[dict]]]:
     return out
 
 
-def react(conn, events: list[dict]) -> dict:
+def react(conn, events: list[dict], force: bool = False) -> dict:
     """Run one focused pass per kind of change."""
+    if not force:
+        blocked = rate_limited(conn)
+        if blocked:
+            return {"result": f"skipped: {blocked}", "is_error": False, "skipped": True}
     results = []
     for name, group in chunk(events):
         with db.run(conn, "reactor", trigger=f"{name}: {len(group)} event(s)") as run_id:

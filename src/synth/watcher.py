@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from datetime import datetime, timezone
 
 from synth import config, db
 from synth.applekit import call, SynthdError
@@ -74,7 +75,7 @@ def poll_mail(state: dict) -> list[dict]:
         # minute; probing the newest id costs about two seconds, so the expensive path only
         # runs when the mailbox has actually moved.
         try:
-            probe = call("mail_probe", account=account, timeout=120)
+            probe = call("mail_probe", account=account, timeout=240)
         except SynthdError as e:
             events.append({"kind": "mail_error", "account": account, "detail": str(e)})
             continue
@@ -135,6 +136,45 @@ def poll_notes(conn, state: dict) -> list[dict]:
         )
     conn.commit()
     return events
+
+
+# ---------------------------------------------------------------- triage
+
+# Only these are worth a model's attention. The `*_changed` kinds are FSEvents telling the
+# watcher that a directory moved -- they are a signal to poll, not work in themselves, and
+# Mail rewrites its store constantly. Treating them as work drove 800 reactor runs that
+# produced 13 reminders between them.
+ACTIONABLE = {"mail_new", "note_edited"}
+# EventKit changes are actionable, but only when Synth did not cause them itself.
+SELF_WINDOW_SECONDS = 600
+
+
+def caused_by_synth(conn, seconds: int = SELF_WINDOW_SECONDS) -> bool:
+    """Did Synth write to Calendar or Reminders just now?
+
+    The EventKit observer fires on Synth's own writes as loudly as on Arun's, so without this
+    every reminder Synth creates schedules another run to look at it.
+    """
+    row = conn.execute(
+        "SELECT at FROM action_log WHERE target_kind IN ('reminder','event') "
+        "ORDER BY id DESC LIMIT 1").fetchone()
+    if row is None:
+        return False
+    try:
+        last = datetime.fromisoformat(row["at"].replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if last.tzinfo is None:
+        last = last.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - last).total_seconds() < seconds
+
+
+def actionable(conn, events: list[dict]) -> list[dict]:
+    out = [e for e in events if e.get("kind") in ACTIONABLE]
+    if any(e.get("kind") == "eventkit_changed" for e in events) and not caused_by_synth(conn):
+        out.append({"kind": "eventkit_changed",
+                    "detail": "Calendar or Reminders changed and Synth did not cause it"})
+    return out
 
 
 # ---------------------------------------------------------------- debounce
