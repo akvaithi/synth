@@ -120,15 +120,24 @@ def add_facts(payload: dict, source_ref: str = "interview", document_id: int = 0
 
 
 def create_reminder(title: str, reason: str, due: str = "", list: str = "",
-                    notes: str = "", entity: str = "", externally_set: bool = False) -> str:
+                    notes: str = "", entity: str = "", externally_set: bool = False,
+                    force: bool = False) -> str:
     """Create a reminder in a managed list (Personal, Academics, Career, Research).
 
     Give `due` as ISO 8601 WITH a time — an untimed reminder never surfaces in Calendar, and
     Arun reads his day from Calendar. Set externally_set true only for a real external
-    deadline, false for a target he chose. `reason` is required and is recorded."""
+    deadline, false for a target he chose.
+
+    `reason` is required, is recorded, and must say why this helps Arun in words he would
+    understand months from now. Placeholders like "test" are refused. Never create a real
+    reminder to probe this schema.
+
+    If something is already scheduled near that time the call is REFUSED and returns the
+    match — do nothing unless it is genuinely a different commitment, then pass force."""
     return _j(_with_conn(lambda c: tools.create_reminder(
         c, title=title, reason=reason, due=due or None, list=list or None,
-        notes=notes or None, entity=entity or None, externally_set=externally_set)))
+        notes=notes or None, entity=entity or None, externally_set=externally_set,
+        force=force)))
 
 
 def complete_reminder(ek_identifier: str, reason: str, evidence_source: str = "") -> str:

@@ -177,9 +177,33 @@ def import_reminders(conn, run_id=None) -> dict:
 
 def create_reminder(conn, title: str, reason: str, due: str = None, list: str = None,
                     notes: str = None, entity: str = None, externally_set: bool = False,
-                    run_id=None, evidence_id=None) -> dict:
+                    force: bool = False, run_id=None, evidence_id=None) -> dict:
+    """Create a reminder, refusing to duplicate something already scheduled.
+
+    The check runs here rather than only in the prompt because prompts are advice and this
+    is a rule. Two concurrent reactor batches created the same USAC reminder twice; a
+    structural check makes that impossible instead of merely discouraged.
+    """
+    # Validate the reason before anything else. The duplicate check returns early, and with
+    # the order reversed a placeholder reason slipped through unexamined whenever the
+    # proposed time happened to clash.
+    actions._require_reason(reason)
     if list and list not in config.MANAGED_LISTS:
         raise ValueError(f"{list!r} is not a managed list; expected one of {config.MANAGED_LISTS}")
+    if due and not force:
+        from synth import agenda as _a
+        try:
+            check = _a.already_scheduled(title, due)
+        except Exception:
+            check = {"matches": []}
+        if check.get("matches"):
+            m = check["matches"][0]
+            return {"created": False, "refused": "already scheduled",
+                    "match": m,
+                    "advice": (f"{m['kind']} {m['title']!r} is already at {m['when']}, "
+                               f"{m['minutes_apart']} minutes from the proposed time. "
+                               f"Do nothing unless this is genuinely a different commitment, "
+                               f"in which case pass force=true and say why in the reason.")}
     action_id, result = actions.create_reminder(
         conn, title=title, reason=reason, due=due, list=list, notes=notes,
         run_id=run_id, evidence_id=evidence_id)
@@ -195,7 +219,8 @@ def create_reminder(conn, title: str, reason: str, due: str = None, list: str = 
         "ON CONFLICT (ek_identifier) DO NOTHING",
         (title, created.get("due"), eid, created["id"], int(externally_set)))
     conn.commit()
-    return {"action_id": action_id, "reminder": created}
+    # Same shape as the refusal path, so a caller can always read `created` to know.
+    return {"created": True, "action_id": action_id, "reminder": created}
 
 
 def complete_reminder(conn, ek_identifier: str, reason: str, evidence_source: str = None,

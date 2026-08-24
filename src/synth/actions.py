@@ -13,10 +13,22 @@ class UnexplainedWrite(ValueError):
     pass
 
 
+# Reasons that explain nothing. The model created real reminders in Arun's list titled
+# "test" while probing the API schema, then had to retract them. A reason is for him to read
+# later, not a placeholder to satisfy a required field.
+PLACEHOLDER_REASONS = {"test", "testing", "probe", "probing", "check", "checking", "debug",
+                       "example", "sample", "foo", "bar", "tmp", "temp", "n/a", "none"}
+
+
 def _require_reason(reason: str) -> str:
     if not reason or not reason.strip():
         raise UnexplainedWrite("every Synth write must carry a reason")
-    return reason.strip()
+    cleaned = reason.strip()
+    if cleaned.lower().rstrip(".!") in PLACEHOLDER_REASONS or len(cleaned) < 12:
+        raise UnexplainedWrite(
+            f"{cleaned!r} is not a reason. Say why this write helps Arun, in words he would "
+            f"understand months from now. Never create a real reminder to probe the API.")
+    return cleaned
 
 
 def _do(conn, action: str, target_kind: str, reason: str, params: dict, *,
