@@ -63,9 +63,9 @@ func calendarInfo(_ c: EKCalendar) -> [String: Any] {
 
 // MARK: - reads
 
-func listEvents(days: Int) -> [[String: Any]] {
-    let start = Date()
-    let end = Calendar.current.date(byAdding: .day, value: days, to: start)!
+func listEvents(days: Int, from: Date? = nil, to: Date? = nil) -> [[String: Any]] {
+    let start = from ?? Date()
+    let end = to ?? Calendar.current.date(byAdding: .day, value: days, to: start)!
     let pred = store.predicateForEvents(withStart: start, end: end, calendars: nil)
     return store.events(matching: pred).map { e in
         [
@@ -269,6 +269,17 @@ func updateReminder(_ req: [String: Any]) throws -> [String: Any] {
     }
     try store.save(r, commit: true)
     return ["after": reminderSnapshot(r), "before": before]
+}
+
+/// Removes a reminder. Deliberately the only deletion in the whole Apple layer, and the
+/// Python side refuses to call it unless action_log proves Synth created the reminder itself.
+/// Cleaning up its own mistakes is Synth's job, not Arun's; deleting anything of his is not.
+func deleteReminder(_ req: [String: Any]) throws -> [String: Any] {
+    guard let id = req["id"] as? String else { throw SynthError(msg: "id is required") }
+    let r = try fetchReminder(id: id)
+    let before = reminderSnapshot(r)
+    try store.remove(r, commit: true)
+    return ["removed": true, "before": before]
 }
 
 func createEvent(_ req: [String: Any]) throws -> [String: Any] {
@@ -746,11 +757,21 @@ func mailProbe(account: String) throws -> [String: Any] {
 ///
 /// Headers only — never `content`, which can force Mail to download the body from the server.
 /// Bodies come from mail_get, one explicit message at a time.
-func mailRecent(account: String, limit: Int) throws -> [[String: Any]] {
+func mailRecent(account: String, limit: Int, mailbox: String = "INBOX") throws -> [[String: Any]] {
     let src = """
     tell application "Mail"
         set acct to first account whose name is \(asQuote(account))
-        set box to mailbox "INBOX" of acct
+        -- Sent mail matters: Synth told Arun to reply to someone he had already replied to,
+        -- because it only ever looked at INBOX.
+        set box to missing value
+        repeat with mb in mailboxes of acct
+            set nm to name of mb
+            if nm is \(asQuote(mailbox)) or nm ends with ("/" & \(asQuote(mailbox))) then
+                set box to mb
+                exit repeat
+            end if
+        end repeat
+        if box is missing value then error "no mailbox named " & \(asQuote(mailbox))
         set n to count of messages of box
         if n = 0 then return ""
         if n > \(limit) then set n to \(limit)
@@ -890,7 +911,10 @@ func handle(_ req: [String: Any]) -> [String: Any] {
             return ["ok": true, "result": store.calendars(for: .reminder).map(calendarInfo)]
         case "events":
             let days = (req["days"] as? Int) ?? 7
-            return ["ok": true, "result": listEvents(days: days)]
+            return ["ok": true, "result": listEvents(
+                days: days,
+                from: parseDate(req["start"] as? String),
+                to: parseDate(req["end"] as? String))]
         case "reminders":
             let inc = (req["includeCompleted"] as? Bool) ?? false
             return ["ok": true, "result": listReminders(includeCompleted: inc)]
@@ -902,6 +926,8 @@ func handle(_ req: [String: Any]) -> [String: Any] {
             return ["ok": true, "result": try uncompleteReminder(req)]
         case "update_reminder":
             return ["ok": true, "result": try updateReminder(req)]
+        case "delete_reminder":
+            return ["ok": true, "result": try deleteReminder(req)]
         case "create_event":
             return ["ok": true, "result": try createEvent(req)]
         case "update_event":
@@ -979,7 +1005,9 @@ func handle(_ req: [String: Any]) -> [String: Any] {
             return ["ok": true, "result": try mailProbe(account: a)]
         case "mail_recent":
             guard let a = req["account"] as? String else { throw SynthError(msg: "account is required") }
-            return ["ok": true, "result": try mailRecent(account: a, limit: (req["limit"] as? Int) ?? 25)]
+            return ["ok": true, "result": try mailRecent(
+                account: a, limit: (req["limit"] as? Int) ?? 25,
+                mailbox: (req["mailbox"] as? String) ?? "INBOX")]
         case "mail_get":
             guard let m = req["messageId"] as? String else { throw SynthError(msg: "messageId is required") }
             return ["ok": true, "result": try mailGet(messageId: m)]

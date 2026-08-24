@@ -16,7 +16,19 @@ ROOT = os.path.expanduser("~/Developer/synth")
 CLAUDE = os.path.expanduser("~/.local/bin/claude")
 PROMPTS = os.path.join(ROOT, "prompts")
 
-REACTOR_TOOLS = [
+# The VM side calls the tool layer directly through `synth call`. Twenty-odd MCP schemas
+# were being re-sent on every turn for no benefit -- MCP earns its keep on the Claude app
+# side, where schemas are the interface, not here.
+SYNTH = os.path.join(ROOT, "bin", "synth")
+DIRECT_TOOLS = [f"Bash({SYNTH}:*)", "WebSearch", "WebFetch"]
+
+# Reads only, for briefs.
+DIRECT_READ_TOOLS = list(DIRECT_TOOLS)
+
+REACTOR_MODEL = os.environ.get("SYNTH_REACTOR_MODEL", "sonnet")
+BRIEF_MODEL = os.environ.get("SYNTH_BRIEF_MODEL", "sonnet")
+
+_LEGACY_MCP_TOOLS = [
     "mcp__synth__search_context", "mcp__synth__get_entity", "mcp__synth__fact_history",
     "mcp__synth__list_obligations", "mcp__synth__read_document", "mcp__synth__today",
     "mcp__synth__activity", "mcp__synth__why", "mcp__synth__mail_recent",
@@ -29,7 +41,7 @@ REACTOR_TOOLS = [
     # unverified. Without these, "verify against the source" is not a thing Synth can do.
     "WebSearch", "WebFetch",
 ]
-BRIEF_TOOLS = [t for t in REACTOR_TOOLS if not t.endswith(
+_LEGACY_BRIEF_TOOLS = [t for t in _LEGACY_MCP_TOOLS if not t.endswith(
     ("create_reminder", "complete_reminder", "update_reminder", "update_obligation",
      "draft_email", "add_facts", "accept_correction"))]
 
@@ -45,7 +57,7 @@ def _prompt(name: str, **fmt) -> str:
 
 
 def run_claude(prompt: str, allowed: list[str], max_turns: int = 40,
-               timeout: int = 1800) -> dict:
+               timeout: int = 1800, model: str | None = None) -> dict:
     env = dict(os.environ)
     env.pop("ANTHROPIC_API_KEY", None)  # never bill the API; this must ride the subscription
     cmd = [
@@ -59,6 +71,8 @@ def run_claude(prompt: str, allowed: list[str], max_turns: int = 40,
         "--permission-mode", "acceptEdits",
         "--max-turns", str(max_turns),
     ]
+    if model:
+        cmd += ["--model", model]
     proc = subprocess.run(cmd, cwd=ROOT, env=env, capture_output=True, timeout=timeout)
     out = proc.stdout.decode("utf-8", errors="replace")
     try:
@@ -98,22 +112,59 @@ def summarise_events(events: list[dict], cap: int = 60) -> str:
     return "\n".join(lines) if lines else "(nothing)"
 
 
+GROUPS = {
+    "mail": {"mail_new", "mail_error"},
+    "schedule": {"eventkit_changed"},
+    "notes": {"note_edited", "notes_error"},
+    "files": {"documents_changed", "mail_changed", "notes_changed"},
+}
+
+
+def chunk(events: list[dict]) -> list[tuple[str, list[dict]]]:
+    """Split a batch by kind.
+
+    One long thread carrying mail, calendar changes and note edits at once burns context on
+    material irrelevant to each decision, and a run that exhausts its budget half way through
+    leaves the work silently incomplete -- which is how a reply that had already been sent
+    got a reminder telling Arun to send it.
+    """
+    out = []
+    for name, kinds in GROUPS.items():
+        group = [e for e in events if e.get("kind") in kinds]
+        if group:
+            out.append((name, group))
+    known = {k for ks in GROUPS.values() for k in ks}
+    rest = [e for e in events if e.get("kind") not in known]
+    if rest:
+        out.append(("other", rest))
+    return out
+
+
 def react(conn, events: list[dict]) -> dict:
-    with db.run(conn, "reactor", trigger=f"{len(events)} change event(s)") as run_id:
-        prompt = _prompt("reactor", events=summarise_events(events))
-        result = run_claude(prompt, REACTOR_TOOLS)
-        conn.execute("UPDATE run_log SET summary = ?, detail = ? WHERE id = ?",
-                     (str(result.get("result", ""))[:2000],
-                      json.dumps({k: v for k, v in result.items() if k != "result"},
-                                 default=str)[:4000], run_id))
-        conn.commit()
-    return result
+    """Run one focused pass per kind of change."""
+    results = []
+    for name, group in chunk(events):
+        with db.run(conn, "reactor", trigger=f"{name}: {len(group)} event(s)") as run_id:
+            prompt = _prompt("reactor", events=summarise_events(group))
+            result = run_claude(prompt, DIRECT_TOOLS, model=REACTOR_MODEL)
+            conn.execute("UPDATE run_log SET summary = ?, detail = ? WHERE id = ?",
+                         (str(result.get("result", ""))[:2000],
+                          json.dumps({k: v for k, v in result.items() if k != "result"},
+                                     default=str)[:4000], run_id))
+            conn.commit()
+            results.append({"group": name, "events": len(group),
+                            "error": result.get("is_error"),
+                            "result": str(result.get("result", ""))})
+    if not results:
+        return {"result": "nothing to react to", "is_error": False}
+    return {"result": "\n\n".join(f"## {r['group']}\n{r['result']}" for r in results),
+            "is_error": any(r["error"] for r in results), "groups": results}
 
 
 def brief(conn, when: str = "morning") -> dict:
     with db.run(conn, "brief", trigger=when) as run_id:
         prompt = _prompt("brief", when=when)
-        result = run_claude(prompt, BRIEF_TOOLS, max_turns=30)
+        result = run_claude(prompt, DIRECT_READ_TOOLS, max_turns=30, model=BRIEF_MODEL)
         conn.execute("UPDATE run_log SET summary = ? WHERE id = ?",
                      (str(result.get("result", ""))[:4000], run_id))
         conn.commit()

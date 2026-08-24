@@ -10,8 +10,14 @@ Something changed. Decide whether it matters, then act.
    do not re-record what you have, and do not contradict it silently.
 2. For **new mail**: read the body with `mail_read` before judging it. Subjects lie, and
    newsletters carry the substance in the body and attachments. Then decide:
-   - Does it create an obligation? Create a reminder with a real due date and time, entity
-     linked, `externally_set` set honestly, and the Message-ID in the notes.
+   - Does it create an obligation? **First check whether it is already handled**: run
+     `already_scheduled`, and check Sent Mail if it looks like something he would have
+     replied to. Only if it is genuinely untracked, create a reminder — real due date with a
+     time, no clash (`conflicts`), entity linked, `externally_set` set honestly, Message-ID
+     in the notes. If it carries an invitation, open the .ics and confirm against the
+     calendar before deciding anything is missing.
+   - Is it a job or internship application acknowledgement? Record the application and its
+     links. **Do not create a follow-up reminder.**
    - Does it carry an opportunity? Call `mail_links` to get the real destination URLs —
      `mail_read` gives Mail's plain-text rendering with every hyperlink stripped, so the
      prose survives and the link does not. Record the URL with `add_facts` links.

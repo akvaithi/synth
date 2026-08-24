@@ -11,6 +11,7 @@
     synth log            what Synth has done
     synth why <id>       why it did one thing
     synth undo <id>      reverse one action
+    synth call <name> [json]  direct tool dispatch (see: synth call)
     synth status         health of every moving part
 """
 from __future__ import annotations
@@ -100,6 +101,39 @@ def cmd_notes(args):
     return 0
 
 
+def cmd_call(args):
+    """synth call <name> [json] — direct dispatch, no MCP round trip."""
+    from synth.registry import ALL
+    if not args:
+        print(" ".join(sorted(ALL)))
+        return 0
+    name = args[0]
+    if name not in ALL:
+        print(json.dumps({"error": f"unknown call {name!r}",
+                          "available": sorted(ALL)}), file=sys.stderr)
+        return 2
+    payload = {}
+    if len(args) > 1:
+        raw = args[1]
+        if raw == "-":
+            raw = sys.stdin.read()
+        try:
+            payload = json.loads(raw)
+        except ValueError as e:
+            print(json.dumps({"error": f"bad json: {e}"}), file=sys.stderr)
+            return 2
+    conn = db.connect()
+    try:
+        result = ALL[name](conn, **payload)
+    except Exception as e:
+        print(json.dumps({"error": f"{type(e).__name__}: {e}"}), file=sys.stderr)
+        return 1
+    finally:
+        conn.close()
+    print(json.dumps(result, default=str, separators=(",", ":")))
+    return 0
+
+
 def cmd_reconcile(args):
     from synth import notes_sync
     conn = db.connect()
@@ -157,7 +191,7 @@ def cmd_status(args):
 
 COMMANDS = {
     "watch": cmd_watch, "react": cmd_react, "brief": cmd_brief, "index": cmd_index,
-    "ocr": cmd_ocr, "enrich": cmd_enrich, "notes": cmd_notes, "reconcile": cmd_reconcile, "log": cmd_log, "why": cmd_why,
+    "ocr": cmd_ocr, "enrich": cmd_enrich, "notes": cmd_notes, "reconcile": cmd_reconcile, "call": cmd_call, "log": cmd_log, "why": cmd_why,
     "undo": cmd_undo, "status": cmd_status,
 }
 

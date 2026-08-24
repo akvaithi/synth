@@ -264,6 +264,47 @@ def update_obligation(conn, ek_identifier: str, reason: str, externally_set: boo
     return {"action_id": action_id, "changed": True}
 
 
+def agenda(conn, date: str) -> dict:
+    """Everything already committed on one local day: events and reminders together."""
+    from synth import agenda as _a
+    return _a.agenda(date)
+
+
+def already_scheduled(conn, title: str, when: str, window_minutes: int = 240) -> dict:
+    """Whether this commitment is already on the calendar or in reminders."""
+    from synth import agenda as _a
+    return _a.already_scheduled(title, when, window_minutes)
+
+
+def conflicts(conn, start: str, minutes: int = 30) -> dict:
+    """What overlaps a proposed slot."""
+    from synth import agenda as _a
+    return _a.conflicts(start, minutes)
+
+
+def find_free_slot(conn, date: str, minutes: int = 30, earliest_hour: int = 8,
+                   latest_hour: int = 21) -> dict:
+    """First free slot on a day, avoiding events and other reminders."""
+    from synth import agenda as _a
+    return _a.find_free_slot(date, minutes, earliest_hour, latest_hour)
+
+
+def mail_recent(conn, account: str, limit: int = 25, mailbox: str = "INBOX") -> list:
+    """Inbox or any other mailbox. Use mailbox='Sent Mail' to check what has been replied to."""
+    return call("mail_recent", account=account, limit=limit, mailbox=mailbox, timeout=300)
+
+
+def mail_read(conn, account: str, index: int, messageId: str, mailbox: str = "INBOX") -> dict:
+    return call("mail_get_at", account=account, index=index, messageId=messageId,
+                mailbox=mailbox, timeout=600)
+
+
+def mail_attachments(conn, account: str, index: int, messageId: str,
+                     mailbox: str = "INBOX") -> dict:
+    return call("mail_attachments", account=account, index=index, messageId=messageId,
+                mailbox=mailbox, timeout=300)
+
+
 def read_note(conn, doc: str = "", note_id: str = "") -> dict:
     """Read a note's current body — the channel for corrections Arun types into the mirror."""
     from synth.notes_sync import html_to_text
@@ -302,6 +343,28 @@ def mail_links(conn, account: str, index: int, messageId: str, mailbox: str = "I
     """Destination URLs and their anchor text, parsed from the message's HTML part."""
     from synth import maillinks
     return maillinks.extract(account, index, messageId, mailbox=mailbox)
+
+
+def retract_reminder(conn, ek_identifier: str, reason: str, run_id=None) -> dict:
+    """Remove a reminder Synth created by mistake.
+
+    The only deletion Synth can perform, and it is gated on provenance: action_log must show
+    that Synth created this exact reminder. Anything Arun made is refused outright. Cleaning
+    up its own noise is Synth's responsibility; his reminders are not Synth's to touch.
+    """
+    made = conn.execute(
+        "SELECT id FROM action_log WHERE action = 'create_reminder' AND target_id = ?",
+        (ek_identifier,)).fetchone()
+    if made is None:
+        raise PermissionError(
+            f"refusing to remove {ek_identifier}: no action_log entry shows Synth created it")
+    result = call("delete_reminder", id=ek_identifier, timeout=180)
+    action_id = db.log_action(conn, "retract_reminder", "reminder", reason, run_id=run_id,
+                              target_id=ek_identifier, before=result.get("before"))
+    conn.execute("UPDATE obligation SET status = 'dropped', updated_at = ? "
+                 "WHERE ek_identifier = ?", (db.now(), ek_identifier))
+    conn.commit()
+    return {"action_id": action_id, "retracted": result.get("before", {}).get("title")}
 
 
 def draft_email(conn, to: list[str], subject: str, body: str, reason: str,
