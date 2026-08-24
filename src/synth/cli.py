@@ -12,6 +12,7 @@
     synth why <id>       why it did one thing
     synth undo <id>      reverse one action
     synth call <name> [json]  direct tool dispatch (see: synth call)
+    synth serve          run the connector HTTP server (behind Cloudflare)
     synth status         health of every moving part
 """
 from __future__ import annotations
@@ -98,6 +99,13 @@ def cmd_notes(args):
     conn = db.connect()
     with db.run(conn, "notes_sync", trigger="manual") as run_id:
         print(json.dumps(notes_sync.sync_all(conn, run_id=run_id), indent=2))
+    return 0
+
+
+def cmd_serve(args):
+    """synth serve — run the connector HTTP server."""
+    from synth.http_server import main
+    main()
     return 0
 
 
@@ -191,7 +199,7 @@ def cmd_status(args):
 
 COMMANDS = {
     "watch": cmd_watch, "react": cmd_react, "brief": cmd_brief, "index": cmd_index,
-    "ocr": cmd_ocr, "enrich": cmd_enrich, "notes": cmd_notes, "reconcile": cmd_reconcile, "call": cmd_call, "log": cmd_log, "why": cmd_why,
+    "ocr": cmd_ocr, "enrich": cmd_enrich, "notes": cmd_notes, "reconcile": cmd_reconcile, "call": cmd_call, "serve": cmd_serve, "log": cmd_log, "why": cmd_why,
     "undo": cmd_undo, "status": cmd_status,
 }
 

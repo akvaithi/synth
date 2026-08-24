@@ -222,3 +222,33 @@ CREATE TABLE IF NOT EXISTS enrichment (
     run_id      INTEGER REFERENCES run_log(id),
     at          TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+-- ---------------------------------------------------------------- connector auth
+
+CREATE TABLE IF NOT EXISTS oauth_client (
+    client_id      TEXT PRIMARY KEY,
+    client_secret  TEXT,
+    name           TEXT,
+    redirect_uris  TEXT NOT NULL,
+    registered_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS oauth_code (
+    code           TEXT PRIMARY KEY,
+    client_id      TEXT NOT NULL,
+    redirect_uri   TEXT NOT NULL,
+    challenge      TEXT,
+    challenge_method TEXT,
+    subject        TEXT,
+    expires_at     TEXT NOT NULL,
+    used           INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS oauth_token (
+    token          TEXT PRIMARY KEY,
+    client_id      TEXT NOT NULL,
+    subject        TEXT,
+    issued_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    expires_at     TEXT,
+    revoked_at     TEXT
+);

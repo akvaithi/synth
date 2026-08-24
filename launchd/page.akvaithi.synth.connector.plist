@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>page.akvaithi.synth.connector</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/akvaithi/Developer/synth/bin/synth</string>
+        <string>serve</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>WorkingDirectory</key>
+    <string>/Users/akvaithi/Developer/synth</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/akvaithi/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>SYNTH_HTTP_HOST</key>
+        <string>127.0.0.1</string>
+        <key>SYNTH_HTTP_PORT</key>
+        <string>8787</string>
+        <!-- Set once the hostname is decided; everything else derives from it. -->
+        <key>SYNTH_PUBLIC_URL</key>
+        <string>https://personal.akvaithi.page</string>
+        <!-- 1 means refuse any request Cloudflare Access has not vouched for. -->
+        <key>SYNTH_REQUIRE_ACCESS</key>
+        <string>1</string>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>/Users/akvaithi/Developer/synth/.state/connector.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/akvaithi/Developer/synth/.state/connector.err.log</string>
+</dict>
+</plist>
