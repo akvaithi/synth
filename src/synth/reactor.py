@@ -161,6 +161,12 @@ def rate_limited(conn) -> str | None:
     return None
 
 
+# Beyond this, a single run carries so much unrelated material that judgement degrades and
+# the budget can run out midway -- which is how an already-sent reply got a reminder telling
+# Arun to send it.
+MAX_EVENTS_PER_RUN = int(os.environ.get("SYNTH_MAX_EVENTS_PER_RUN", "12"))
+
+
 def chunk(events: list[dict]) -> list[tuple[str, list[dict]]]:
     """Split a batch by kind.
 
@@ -170,14 +176,22 @@ def chunk(events: list[dict]) -> list[tuple[str, list[dict]]]:
     got a reminder telling Arun to send it.
     """
     out = []
+
+    def add(name, group):
+        for i in range(0, len(group), MAX_EVENTS_PER_RUN):
+            part = group[i:i + MAX_EVENTS_PER_RUN]
+            label = name if len(group) <= MAX_EVENTS_PER_RUN else \
+                f"{name} {i // MAX_EVENTS_PER_RUN + 1}/{-(-len(group) // MAX_EVENTS_PER_RUN)}"
+            out.append((label, part))
+
     for name, kinds in GROUPS.items():
         group = [e for e in events if e.get("kind") in kinds]
         if group:
-            out.append((name, group))
+            add(name, group)
     known = {k for ks in GROUPS.values() for k in ks}
     rest = [e for e in events if e.get("kind") not in known]
     if rest:
-        out.append(("other", rest))
+        add("other", rest)
     return out
 
 

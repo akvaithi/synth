@@ -35,6 +35,11 @@ def cmd_watch(args):
         return 0
     print(f"reacting to {len(pending['events'])} pending event(s)")
     result = reactor.react(conn, pending["events"])
+    if result.get("skipped"):
+        # Hold the queue. Clearing it on a skipped run discards the work permanently, which
+        # is how a day of detected mail was silently lost when the rate limit tripped.
+        print(str(result.get("result", "")))
+        return 0
     watcher.clear_pending()
     print(str(result.get("result", ""))[:2000])
     return 0
@@ -49,6 +54,9 @@ def cmd_react(args):
         print("nothing pending")
         return 0
     result = reactor.react(conn, events, force="--force" in args)
+    if result.get("skipped"):
+        print(str(result.get("result", "")))
+        return 0
     watcher.clear_pending()
     print(str(result.get("result", ""))[:4000])
     return 0
