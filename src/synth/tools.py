@@ -264,6 +264,17 @@ def update_obligation(conn, ek_identifier: str, reason: str, externally_set: boo
     return {"action_id": action_id, "changed": True}
 
 
+def latest_brief(conn) -> dict:
+    """The most recent brief, for relaying into the Remote Control session."""
+    row = conn.execute(
+        "SELECT id, trigger, started_at, summary FROM run_log WHERE job = 'brief' "
+        "AND status = 'ok' AND summary IS NOT NULL ORDER BY id DESC LIMIT 1").fetchone()
+    if row is None:
+        return {"found": False}
+    return {"found": True, "when": row["trigger"], "ran_at": db.local(row["started_at"]),
+            "text": row["summary"]}
+
+
 def agenda(conn, date: str) -> dict:
     """Everything already committed on one local day: events and reminders together."""
     from synth import agenda as _a

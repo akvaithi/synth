@@ -209,11 +209,21 @@ def brief(conn, when: str = "morning") -> dict:
                      (str(result.get("result", ""))[:4000], run_id))
         conn.commit()
         if not result.get("is_error"):
-            from synth import notes_sync
+            from synth import deliver, notes_sync
+            problems = []
             try:
                 notes_sync.render(conn, "brief", run_id=run_id)
-            except Exception as e:  # a delivery failure must not lose the brief
+            except Exception as e:
+                problems.append(f"Notes delivery failed: {e}")
+            # The headless run cannot push; the Remote Control session can. Hand it over.
+            try:
+                d = deliver.deliver_brief(when)
+                if not d.get("delivered"):
+                    problems.append(f"push delivery failed: {d.get('reason')}")
+            except Exception as e:
+                problems.append(f"push delivery failed: {e}")
+            if problems:  # a delivery failure must never lose the brief itself
                 conn.execute("UPDATE run_log SET detail = ? WHERE id = ?",
-                             (f"brief written but Notes delivery failed: {e}", run_id))
+                             ("; ".join(problems)[:500], run_id))
                 conn.commit()
     return result

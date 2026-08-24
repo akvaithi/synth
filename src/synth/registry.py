@@ -22,6 +22,7 @@ READ = {
     "today": tools.today,
     "activity": tools.activity,
     "why": tools.why,
+    "latest_brief": tools.latest_brief,
     "agenda": tools.agenda,
     "already_scheduled": tools.already_scheduled,
     "conflicts": tools.conflicts,
