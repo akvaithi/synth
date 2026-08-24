@@ -8,6 +8,11 @@ from __future__ import annotations
 
 from synth import tools
 
+
+def _invites():
+    from synth import invites
+    return invites
+
 READ = {
     "search": tools.search_context,
     "entity": tools.get_entity,
@@ -26,6 +31,7 @@ READ = {
     "mail_links": tools.mail_links,
     "mail_attachments": tools.mail_attachments,
     "read_note": tools.read_note,
+    "read_invitation": _invites().read_invitation,
 }
 
 WRITE = {
