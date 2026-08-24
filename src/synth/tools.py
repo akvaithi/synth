@@ -289,6 +289,48 @@ def update_obligation(conn, ek_identifier: str, reason: str, externally_set: boo
     return {"action_id": action_id, "changed": True}
 
 
+def sync_obligations(conn, run_id=None) -> dict:
+    """Reconcile obligation status against what Reminders actually holds.
+
+    Synth updated status only when Synth did the completing, so anything Arun ticked off
+    himself stayed 'open' in the database and kept appearing in briefs as overdue. Nine
+    obligations were nagging him about work he had already finished.
+
+    EventKit is the source of truth for state here; the database holds the reasoning.
+    """
+    live = {r["id"]: r for r in call("reminders", includeCompleted=True, timeout=300)}
+    completed, vanished, reopened = [], [], []
+    for o in conn.execute(
+        "SELECT ek_identifier, title, status FROM obligation "
+        "WHERE ek_identifier IS NOT NULL AND ek_kind = 'reminder'"
+    ).fetchall():
+        r = live.get(o["ek_identifier"])
+        if r is None:
+            if o["status"] in ("open", "waiting"):
+                conn.execute("UPDATE obligation SET status='dropped', updated_at=? "
+                             "WHERE ek_identifier=?", (db.now(), o["ek_identifier"]))
+                vanished.append(o["title"])
+            continue
+        if r["completed"] and o["status"] in ("open", "waiting"):
+            conn.execute("UPDATE obligation SET status='done', updated_at=? "
+                         "WHERE ek_identifier=?", (db.now(), o["ek_identifier"]))
+            completed.append(o["title"])
+        elif not r["completed"] and o["status"] == "done":
+            # He un-ticked it; it is live again.
+            conn.execute("UPDATE obligation SET status='open', updated_at=? "
+                         "WHERE ek_identifier=?", (db.now(), o["ek_identifier"]))
+            reopened.append(o["title"])
+    conn.commit()
+    if completed or vanished or reopened:
+        db.log_action(conn, "sync_obligations", "db",
+                      f"reconciled against Reminders: {len(completed)} completed by Arun, "
+                      f"{len(vanished)} deleted, {len(reopened)} reopened",
+                      run_id=run_id,
+                      after={"completed": completed, "vanished": vanished,
+                             "reopened": reopened})
+    return {"completed_by_arun": completed, "deleted": vanished, "reopened": reopened}
+
+
 def latest_brief(conn) -> dict:
     """The most recent brief, for relaying into the Remote Control session."""
     row = conn.execute(

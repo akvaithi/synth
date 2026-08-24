@@ -27,6 +27,11 @@ from synth import config, db
 def cmd_watch(args):
     from synth import reactor, watcher
     conn = db.connect()
+    try:
+        from synth import tools
+        tools.sync_obligations(conn)
+    except Exception:
+        pass  # detection must not fail because reconciliation did
     events = watcher.actionable(conn, watcher.collect(conn))
     pending = watcher.accumulate(events)
     if not watcher.due(pending):

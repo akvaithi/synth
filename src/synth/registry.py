@@ -23,6 +23,7 @@ READ = {
     "activity": tools.activity,
     "why": tools.why,
     "latest_brief": tools.latest_brief,
+    "sync_obligations": tools.sync_obligations,
     "agenda": tools.agenda,
     "already_scheduled": tools.already_scheduled,
     "conflicts": tools.conflicts,

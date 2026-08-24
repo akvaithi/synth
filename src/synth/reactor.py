@@ -222,6 +222,14 @@ def react(conn, events: list[dict], force: bool = False) -> dict:
 
 def brief(conn, when: str = "morning") -> dict:
     with db.run(conn, "brief", trigger=when) as run_id:
+        # Reconcile first, or the brief reports work Arun has already finished as overdue.
+        try:
+            from synth import tools
+            tools.sync_obligations(conn, run_id=run_id)
+        except Exception as e:
+            conn.execute("UPDATE run_log SET detail = ? WHERE id = ?",
+                         (f"obligation sync failed: {e}", run_id))
+            conn.commit()
         prompt = _prompt("brief", when=when)
         result = run_claude(prompt, DIRECT_READ_TOOLS, max_turns=30, model=BRIEF_MODEL)
         conn.execute("UPDATE run_log SET summary = ? WHERE id = ?",
