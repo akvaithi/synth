@@ -20,7 +20,13 @@ PROMPTS = os.path.join(ROOT, "prompts")
 # were being re-sent on every turn for no benefit -- MCP earns its keep on the Claude app
 # side, where schemas are the interface, not here.
 SYNTH = os.path.join(ROOT, "bin", "synth")
-DIRECT_TOOLS = [f"Bash({SYNTH}:*)", "WebSearch", "WebFetch"]
+# Allow every spelling of the same command. Runs happen with cwd=ROOT, so the model reaches
+# for the relative form; an absolute-only allowlist silently failed to match and the run
+# stalled asking for approval it could never get.
+DIRECT_TOOLS = [
+    "Bash(bin/synth:*)", "Bash(./bin/synth:*)", f"Bash({SYNTH}:*)",
+    "WebSearch", "WebFetch",
+]
 
 # Reads only, for briefs.
 DIRECT_READ_TOOLS = list(DIRECT_TOOLS)
@@ -63,9 +69,10 @@ def run_claude(prompt: str, allowed: list[str], max_turns: int = 40,
     cmd = [
         CLAUDE, "-p", prompt,
         "--output-format", "json",
-        # Passing the MCP config explicitly avoids the interactive "pending approval"
-        # state that a project-scoped .mcp.json sits in, which no headless run can clear.
-        "--mcp-config", os.path.join(ROOT, ".mcp.json"),
+        # No MCP on the VM side. The tool layer is reached through `synth call`, so loading
+        # the server here would re-add two dozen schemas on every turn -- the exact cost this
+        # was changed to avoid. An empty strict config guarantees none are loaded.
+        # --strict-mcp-config with no --mcp-config loads no servers at all.
         "--strict-mcp-config",
         "--allowed-tools", ",".join(allowed),
         "--permission-mode", "acceptEdits",
