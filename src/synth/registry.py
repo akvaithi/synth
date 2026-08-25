@@ -41,6 +41,8 @@ WRITE = {
     "create_reminder": tools.create_reminder,
     "update_reminder": tools.update_reminder,
     "complete_reminder": tools.complete_reminder,
+    "create_event": tools.create_event,
+    "update_event": tools.update_event,
     "update_obligation": tools.update_obligation,
     "draft_email": tools.draft_email,
     "accept_correction": tools.accept_correction,

@@ -83,11 +83,13 @@ def update_reminder(conn, *, id, reason, run_id=None, evidence_id=None, **fields
 
 
 def create_event(conn, *, title, start, reason, calendar=None, end=None, notes=None,
-                 location=None, run_id=None, evidence_id=None):
+                 location=None, allDay=False, run_id=None, evidence_id=None):
     params = {"title": title, "start": start}
     for k, v in (("calendar", calendar), ("end", end), ("notes", notes), ("location", location)):
         if v:
             params[k] = v
+    # Sent unconditionally: False is meaningful, and the loop above drops falsy values.
+    params["allDay"] = bool(allDay)
     return _do(conn, "create_event", "event", reason, params,
                run_id=run_id, evidence_id=evidence_id)
 

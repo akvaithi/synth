@@ -27,3 +27,11 @@ MAIL_SCAN_LIMIT = 25
 
 # Reminder lists Synth may write to. Others are read-only to Synth.
 MANAGED_LISTS = ["Personal", "Academics", "Career", "Research"]
+
+# Calendars Synth may create events in. Others are read-only to Synth, the same way
+# MANAGED_LISTS works for Reminders. Anything not named here is refused before EventKit
+# is touched, so a mis-read invitation cannot land on a shared or subscribed calendar.
+MANAGED_CALENDARS = ["Personal", "Semester Calendar", "College Events", "Meetings"]
+
+# Where an event goes when the caller does not name a calendar.
+DEFAULT_CALENDAR = "Personal"

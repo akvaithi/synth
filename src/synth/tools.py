@@ -254,6 +254,69 @@ def update_reminder(conn, ek_identifier: str, reason: str, run_id=None, **fields
     return {"action_id": action_id, "reminder": after}
 
 
+def create_event(conn, title: str, start: str, reason: str, end: str = None,
+                 calendar: str = None, location: str = None, notes: str = None,
+                 all_day: bool = False, force: bool = False,
+                 run_id=None, evidence_id=None) -> dict:
+    """Put an event on the calendar, refusing to duplicate one that is already there.
+
+    The guard matters more here than anywhere else: the reminders Arun objected to were all
+    for things already on his calendar, because Synth had no way to see that an invitation
+    had been accepted. Creating the event blind would make the same mistake in the other
+    direction — two Dell Nights instead of one.
+    """
+    actions._require_reason(reason)
+    cal = calendar or config.DEFAULT_CALENDAR
+    if cal not in config.MANAGED_CALENDARS:
+        raise ValueError(
+            f"{cal!r} is not a managed calendar; expected one of {config.MANAGED_CALENDARS}")
+    if not force:
+        from synth import agenda as _a
+        try:
+            check = _a.already_scheduled(title, start)
+        except Exception:
+            check = {"matches": []}
+        if check.get("matches"):
+            m = check["matches"][0]
+            return {"created": False, "refused": "already scheduled",
+                    "match": m,
+                    "advice": (f"{m['kind']} {m['title']!r} is already at {m['when']}, "
+                               f"{m['minutes_apart']} minutes from the proposed start. "
+                               f"Assume the invitation was already accepted. Create this "
+                               f"only if it is genuinely a separate commitment, with "
+                               f"force=true and the reason saying why.")}
+    action_id, result = actions.create_event(
+        conn, title=title, start=start, reason=reason, calendar=cal, end=end,
+        notes=notes, location=location, allDay=all_day,
+        run_id=run_id, evidence_id=evidence_id)
+    created = result["created"]
+    # No obligation row. An event is a commitment, not a task, and nothing reconciles event
+    # state back from EventKit — an 'open' row for a meeting that simply happened would sit
+    # in every brief as overdue, which is the exact bug sync_obligations was written to fix.
+    out = {"created": True, "action_id": action_id, "event": created}
+    try:
+        from synth import agenda as _a
+        clash = _a.conflicts(created["start"], minutes=45)
+        if clash.get("conflicts"):
+            out["conflicts"] = clash["conflicts"]
+            out["note"] = ("This lands on top of something already scheduled. It was still "
+                           "created — say so in the brief so Arun can decide.")
+    except Exception:
+        pass
+    return out
+
+
+def update_event(conn, ek_identifier: str, reason: str, run_id=None, **fields) -> dict:
+    """Edit an existing event. Partial: a field not named is never cleared.
+
+    Reversible — db.REVERSALS restores the previous title, times, location and notes from
+    the snapshot taken before the write.
+    """
+    action_id, result = actions.update_event(
+        conn, id=ek_identifier, reason=reason, run_id=run_id, **fields)
+    return {"action_id": action_id, "event": result.get("after")}
+
+
 def update_obligation(conn, ek_identifier: str, reason: str, externally_set: bool = None,
                       entity: str = None, status: str = None, run_id=None) -> dict:
     """Correct an obligation's metadata: whether the deadline is externally imposed, which

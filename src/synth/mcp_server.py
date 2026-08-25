@@ -150,6 +150,41 @@ def complete_reminder(ek_identifier: str, reason: str, evidence_source: str = ""
         evidence_source=evidence_source or None)))
 
 
+def create_event(title: str, start: str, reason: str, end: str = "",
+                 calendar: str = "", location: str = "", notes: str = "",
+                 all_day: bool = False, force: bool = False) -> str:
+    """Create a calendar event in a managed calendar (Personal, Semester Calendar,
+    College Events, Meetings). Defaults to Personal.
+
+    `start` and `end` are ISO 8601; without `end` the event runs one hour. Use this when a
+    commitment has a place in the day — a meeting, an interview, a session. Use
+    create_reminder instead for a task with a deadline.
+
+    Before calling, check agenda for that day. If something is already scheduled near that
+    time the call is REFUSED and returns the match: assume the invitation was already
+    accepted rather than creating a second copy. Pass force only for a genuinely separate
+    commitment, and say why in the reason.
+
+    `reason` is required and recorded. The event is created even when it overlaps something
+    else, but the overlap comes back in `conflicts` — report it to Arun."""
+    return _j(_with_conn(lambda c: tools.create_event(
+        c, title=title, start=start, reason=reason, end=end or None,
+        calendar=calendar or None, location=location or None, notes=notes or None,
+        all_day=all_day, force=force)))
+
+
+def update_event(ek_identifier: str, reason: str, title: str = "", start: str = "",
+                 end: str = "", location: str = "", notes: str = "") -> str:
+    """Edit an existing event: reschedule it, rename it, set a location or notes.
+
+    Partial — a field left empty is not touched, never cleared. Get the identifier from
+    agenda or today. Reversible with undo, which restores the previous values."""
+    fields = {k: v for k, v in (("title", title), ("start", start), ("end", end),
+                                ("location", location), ("notes", notes)) if v}
+    return _j(_with_conn(lambda c: tools.update_event(
+        c, ek_identifier=ek_identifier, reason=reason, **fields)))
+
+
 def agenda(date: str) -> str:
     """Everything already committed on one local day (YYYY-MM-DD): events and reminders.
     Consult this before creating anything."""
@@ -263,7 +298,9 @@ READ_TOOLS = [search_context, get_entity, fact_history, list_obligations, read_d
               today, activity, why, mail_recent, mail_read, mail_attachments, mail_links, read_note, agenda, already_scheduled,
               conflicts, free_slot, read_invitation, latest_brief]
 WRITE_TOOLS = [add_facts, create_reminder, complete_reminder, update_reminder,
-               update_obligation, draft_email, accept_correction, retract_reminder, undo]
+               create_event, update_event,
+               update_obligation, draft_email, accept_correction, retract_reminder,
+               undo]
 
 
 DOCTRINE_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(

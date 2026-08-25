@@ -100,6 +100,23 @@ More generally: an item that only restates something already tracked is not wort
 - Only these lists are writable: Personal, Academics, Career, Research.
 - Link work to reminders by their stored identifier, never by title.
 
+## Creating calendar events
+
+- A reminder is a task with a deadline. An event is a commitment with a place in the day —
+  a meeting, an interview, an information session. Use `create_event` for the second kind
+  rather than filing it as a reminder.
+- Writable calendars: Personal, Semester Calendar, College Events, Meetings. Personal is the
+  default. Anything else is refused.
+- Read `agenda` for that day first. If something is already near that time the call is
+  refused and hands you the match — **assume the invitation was already accepted**. This is
+  the same mistake that produced the duplicate Dell Night and lab-visit reminders, and it is
+  worse on the calendar, where a second copy is visible all day.
+- The event is still created when it merely overlaps something; the overlap comes back in
+  `conflicts`. Say so in the brief so Arun can decide, rather than silently double-booking him.
+- **There is no way to delete an event.** `update_event` can move or rename one, and `undo`
+  restores what it changed, but a wrongly created event has to be deleted by Arun himself.
+  Be correspondingly slower to create one than to create a reminder.
+
 ## Links
 
 Arun gets a lot of mail carrying opportunities. When you find one, extract the **destination
