@@ -8,8 +8,11 @@ Something changed. Decide whether it matters, then act.
 
 1. Read before writing. Use `search_context` and `get_entity` to see what is already known —
    do not re-record what you have, and do not contradict it silently.
-2. For **new mail**: read the body with `mail_read` before judging it. Subjects lie, and
-   newsletters carry the substance in the body and attachments. Then decide:
+2. For **new mail**: everything reaching you has already survived a free filter and a
+   subject-line pass, so it is here because it looked like it mattered. Read the body with
+   `mail_read` when the subject leaves the decision open — a message from a person, or one
+   naming something Arun has applied to, usually buries the substance. When the subject
+   already settles it, do not spend a body read to confirm what you know. Then decide:
    - Does it create an obligation? **First check whether it is already handled**: run
      `already_scheduled`, and check Sent Mail if it looks like something he would have
      replied to. Only if it is genuinely untracked, create a reminder — real due date with a

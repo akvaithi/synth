@@ -1,5 +1,7 @@
 Write Arun's {when} brief.
 
+{depth}
+
 ## Do the work before you write
 
 You have `WebSearch` and `WebFetch`. **Use them before writing, not instead of thinking.**
@@ -40,6 +42,27 @@ Omit any section that is empty.
 is really in Reminders. **Never present something he has already completed as outstanding** —
 that is the fastest way to make a brief worth ignoring. If an item is done, it belongs in
 §2 as closed, not in §1 as overdue.
+
+## Mail that was filtered without a model
+
+These arrived and were sorted by rule, not by judgement. Nothing read their bodies.
+
+**Their links are already extracted below — do not call `mail_links` for anything in this
+section.** Fetching them yourself is what made a previous brief run out of turns and produce
+nothing at all.
+
+Name the ones that could plausibly matter to him, one line each with its link, and let the
+rest stand as a count. If something looks wrongly filtered, say so plainly: the rules are
+meant to be corrected.
+
+{digest}
+
+## What Synth spent
+
+{budget}
+
+Report this in one line at the end of the brief. If anything was skipped for budget, say what
+and why — a quiet day must never look like a day with nothing in it.
 
 ## Tone
 

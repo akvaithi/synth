@@ -58,7 +58,63 @@ def init(path: str = DB_PATH) -> sqlite3.Connection:
     with open(SCHEMA_PATH) as f:
         conn.executescript(f.read())
     conn.commit()
+    migrate(conn)
     return conn
+
+
+def migrate(conn) -> list[str]:
+    """Bring an existing database up to the current schema.
+
+    `init` is all CREATE TABLE IF NOT EXISTS, so it silently does nothing to a table whose
+    definition changed. Anything that alters an existing table belongs here, and every step
+    must be safe to run twice.
+    """
+    done = []
+    # A run killed mid-flight leaves its row saying 'running' forever, which makes `status`
+    # and the ledger both lie. Anything still marked running from a previous process is over.
+    stale = conn.execute(
+        "UPDATE run_log SET status = 'error', finished_at = ?, "
+        "summary = COALESCE(summary, 'process ended before the run finished') "
+        "WHERE status = 'running' AND started_at < datetime('now', '-2 hours')",
+        (now(),)).rowcount
+    if stale:
+        conn.commit()
+        done.append(f"run_log: closed {stale} abandoned run(s)")
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(mail_digest)")}
+    for col, decl in (("mail_index", "INTEGER"), ("links", "TEXT")):
+        if col not in cols:
+            conn.execute(f"ALTER TABLE mail_digest ADD COLUMN {col} {decl}")
+            done.append(f"mail_digest: added {col}")
+    if done:
+        conn.commit()
+    # run_log.status gained 'skipped'. SQLite cannot alter a CHECK constraint, so the table
+    # is rebuilt -- the log is the troubleshooting record and must not be dropped.
+    sql = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='run_log'").fetchone()
+    if sql and "'skipped'" not in sql["sql"]:
+        conn.executescript("""
+            PRAGMA foreign_keys=off;
+            BEGIN;
+            CREATE TABLE run_log_new (
+                id            INTEGER PRIMARY KEY,
+                job           TEXT NOT NULL,
+                trigger       TEXT,
+                started_at    TEXT NOT NULL DEFAULT (datetime('now')),
+                finished_at   TEXT,
+                status        TEXT NOT NULL DEFAULT 'running'
+                                CHECK (status IN ('running','ok','error','skipped')),
+                summary       TEXT,
+                detail        TEXT
+            );
+            INSERT INTO run_log_new SELECT id, job, trigger, started_at, finished_at,
+                                           status, summary, detail FROM run_log;
+            DROP TABLE run_log;
+            ALTER TABLE run_log_new RENAME TO run_log;
+            COMMIT;
+            PRAGMA foreign_keys=on;
+        """)
+        done.append("run_log: status allows 'skipped'")
+    return done
 
 
 # ---------------------------------------------------------------- provenance

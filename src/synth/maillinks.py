@@ -7,10 +7,12 @@ attachments live, so the source is parsed as MIME and only the HTML parts are re
 """
 from __future__ import annotations
 
+import base64
 import email
 import email.policy
 import re
 from html.parser import HTMLParser
+from urllib.parse import unquote
 
 from synth.applekit import call
 
@@ -18,6 +20,39 @@ from synth.applekit import call
 NOISE = re.compile(
     r"(unsubscribe|list-manage|mailchimp|sendgrid|constantcontact|googleusercontent|"
     r"\.(png|jpe?g|gif|css|js)(\?|$)|/track/|/wf/open|utm_medium=email&?$)", re.I)
+
+
+# Institutional mail gets rewritten by link scanners. TAMU wraps everything in Proofpoint,
+# and the result is a 200-character URL that no human can read and that hides where it
+# actually goes -- the opposite of what a brief is for. Unwrapping is pure string work.
+_URLDEFENSE_V3 = re.compile(r"https?://urldefense\.(?:com|proofpoint\.com)/v3/__(.+?)__;(.*?)!!")
+_SAFELINKS = re.compile(r"https?://[\w.-]*safelinks\.protection\.outlook\.com/\?url=([^&]+)")
+
+
+def unwrap(url: str) -> str:
+    """Recover the real destination from a scanner-rewritten link."""
+    m = _SAFELINKS.search(url)
+    if m:
+        return unquote(m.group(1))
+    m = _URLDEFENSE_V3.search(url)
+    if m:
+        target, encoded = m.group(1), m.group(2)
+        # v3 replaces certain characters with '*' and lists them base64 after the ';'.
+        if "*" in target:
+            try:
+                repl = base64.b64decode(encoded + "===").decode("utf-8", "replace")
+            except Exception:
+                repl = ""
+            out, i = [], 0
+            for ch in target:
+                if ch == "*":
+                    out.append(repl[i] if i < len(repl) else "")
+                    i += 1
+                else:
+                    out.append(ch)
+            target = "".join(out)
+        return unquote(target)
+    return url
 
 
 class _Anchors(HTMLParser):
@@ -82,7 +117,7 @@ def extract(account: str, index: int, message_id: str, mailbox: str = "INBOX",
 
     seen, links = set(), []
     for text, url in anchors:
-        url = url.strip().rstrip(".,);")
+        url = unwrap(url.strip().rstrip(".,);"))
         if url in seen or NOISE.search(url):
             continue
         seen.add(url)

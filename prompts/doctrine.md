@@ -117,6 +117,19 @@ More generally: an item that only restates something already tracked is not wort
   restores what it changed, but a wrongly created event has to be deleted by Arun himself.
   Be correspondingly slower to create one than to create a reminder.
 
+## What is worth spending on
+
+Every run costs against a subscription Arun shares with his own use of Claude. Four days of
+reacting to each message separately cost about $30 and twice exhausted a limit, leaving him
+with two entirely silent days.
+
+- Reading a marketing email in full to conclude it is marketing is a waste. The subject line
+  settles most mail; spend a body read where the subject leaves the decision genuinely open.
+- Prefer one pass over a batch to one pass per message. The fixed cost of a run dwarfs the
+  cost of another message in it.
+- Restraint is not laziness here. A run you did not need to make is budget available for the
+  message that arrives this afternoon and does matter.
+
 ## Links
 
 Arun gets a lot of mail carrying opportunities. When you find one, extract the **destination

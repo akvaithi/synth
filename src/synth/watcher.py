@@ -212,10 +212,57 @@ def accumulate(events: list[dict]) -> dict:
 
 
 def due(pending: dict) -> bool:
-    if not pending.get("events"):
+    """Has the queue waited long enough to be worth a model?
+
+    Ordinary mail waits out a batching window, because the fixed cost of a run dwarfs the
+    marginal cost of another message in it -- the log is full of "mail: 1 event(s)" runs that
+    each paid about thirty cents to look at one newsletter. Anything urgent, and any change
+    Arun made himself, still goes at the short debounce.
+    """
+    events = pending.get("events") or []
+    if not events:
         return False
-    return (time.time() - (pending.get("first_at") or 0)) >= config.DEBOUNCE_SECONDS
+    waited = time.time() - (pending.get("first_at") or 0)
+    if waited >= config.MAIL_BATCH_SECONDS:
+        return True
+    if waited < config.DEBOUNCE_SECONDS:
+        return False
+    # Past the short debounce: go now only if something here cannot wait.
+    return any(e.get("kind") != "mail_new" for e in events) or _has_urgent(events)
+
+
+def _has_urgent(events: list[dict]) -> bool:
+    mail = [e for e in events if e.get("kind") == "mail_new"]
+    if not mail:
+        return False
+    try:
+        from synth import triage as tri
+        conn = db.connect()
+        ctx = tri.context(conn)
+        return any(tri.classify(m, ctx)[0] == "urgent" for m in mail)
+    except Exception:
+        # If urgency cannot be judged, let the batching window decide rather than firing.
+        return False
 
 
 def clear_pending():
     _save(PENDING, {"events": [], "first_at": None})
+
+
+def keep_only(handled: list[dict], all_events: list[dict]) -> int:
+    """Drop what a run finished with; keep the rest queued.
+
+    The old code cleared the queue whenever `react` returned, including when every call had
+    been refused by the API. Two days of detected mail was discarded that way and never came
+    back, so nothing here may throw an event away that was not actually dealt with.
+    """
+    def key(e):
+        return (e.get("kind"), e.get("messageId") or e.get("noteId") or e.get("detail"))
+
+    done = {key(e) for e in handled}
+    left = [e for e in all_events if key(e) not in done]
+    if left:
+        _save(PENDING, {"events": left, "first_at": time.time()})
+    else:
+        clear_pending()
+    return len(left)

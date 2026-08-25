@@ -14,6 +14,8 @@
     synth call <name> [json]  direct tool dispatch (see: synth call)
     synth serve          run the connector HTTP server (behind Cloudflare)
     synth status         health of every moving part
+    synth budget [clear|reset <why>]  what it has spent, and what it may spend
+    synth triage [n]     how the free filter sorts the inbox, costing nothing
 """
 from __future__ import annotations
 
@@ -24,29 +26,65 @@ import sys
 from synth import config, db
 
 
+LOCK = os.path.expanduser("~/Developer/synth/.state/reactor.lock")
+
+
+def _exclusive():
+    """Hold a lock for the whole reaction, or bail out.
+
+    A run regularly outlasts the 120s launchd interval, so two passes overlapped and both
+    created the same reminder -- one run's own summary says "a reminder already existed from
+    a concurrent Synth process".
+    """
+    import fcntl
+    os.makedirs(os.path.dirname(LOCK), exist_ok=True)
+    fh = open(LOCK, "w")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.close()
+        return None
+    return fh
+
+
 def cmd_watch(args):
-    from synth import reactor, watcher
+    from synth import budget, reactor, watcher
     conn = db.connect()
+
+    # Detection is free and always runs: the queue must keep filling even while the model is
+    # unaffordable, or a quiet budget day becomes a day of lost mail.
     try:
         from synth import tools
         tools.sync_obligations(conn)
     except Exception:
         pass  # detection must not fail because reconciliation did
+
     events = watcher.actionable(conn, watcher.collect(conn))
     pending = watcher.accumulate(events)
     if not watcher.due(pending):
         n = len(pending.get("events", []))
         print(f"{len(events)} new, {n} pending, debounce not closed")
         return 0
-    print(f"reacting to {len(pending['events'])} pending event(s)")
-    result = reactor.react(conn, pending["events"])
-    if result.get("skipped"):
-        # Hold the queue. Clearing it on a skipped run discards the work permanently, which
-        # is how a day of detected mail was silently lost when the rate limit tripped.
-        print(str(result.get("result", "")))
+
+    b = budget.read_backoff()
+    if b:
+        print(f"holding {len(pending['events'])} event(s): {b['kind']} limit for another "
+              f"{b['seconds_left'] // 60} min")
         return 0
-    watcher.clear_pending()
-    print(str(result.get("result", ""))[:2000])
+
+    lock = _exclusive()
+    if lock is None:
+        print("another reaction is already running; holding the queue")
+        return 0
+    try:
+        print(f"reacting to {len(pending['events'])} pending event(s)")
+        result = reactor.react(conn, pending["events"])
+        # Clear only what was actually finished. Clearing the lot on any return is how two
+        # days of detected mail was thrown away when the API refused every call.
+        watcher.keep_only(result.get("handled", []), pending["events"])
+        print(str(result.get("result", ""))[:2000])
+    finally:
+        lock.close()
     return 0
 
 
@@ -58,12 +96,59 @@ def cmd_react(args):
     if not events:
         print("nothing pending")
         return 0
-    result = reactor.react(conn, events, force="--force" in args)
-    if result.get("skipped"):
-        print(str(result.get("result", "")))
+    lock = _exclusive()
+    if lock is None:
+        print("another reaction is already running")
         return 0
-    watcher.clear_pending()
-    print(str(result.get("result", ""))[:4000])
+    try:
+        result = reactor.react(conn, events, force="--force" in args)
+        watcher.keep_only(result.get("handled", []), events)
+        print(str(result.get("result", ""))[:4000])
+    finally:
+        lock.close()
+    return 0
+
+
+def cmd_budget(args):
+    from synth import budget
+    conn = db.connect()
+    if args and args[0] == "clear":
+        budget.clear_backoff()
+        print("backoff cleared")
+    if args and args[0] == "reset":
+        reason = " ".join(args[1:]) or "reset by hand"
+        e = budget.set_epoch(conn, reason)
+        print(f"ledger now counts from {e['since']} — {reason}")
+    print(budget.summary(conn))
+    return 0
+
+
+def cmd_triage(args):
+    """Show how the free filter would sort the current inbox, without spending anything."""
+    import collections
+    from synth import triage as tri
+    from synth.applekit import call
+    conn = db.connect()
+    ctx = tri.context(conn)
+    limit = int(args[0]) if args and args[0].isdigit() else config.MAIL_SCAN_LIMIT
+    counts = collections.Counter()
+    for account in config.MAIL_ACCOUNTS:
+        try:
+            msgs = call("mail_recent", account=account, limit=limit, timeout=300)
+        except Exception as e:
+            print(f"{account}: {e}")
+            continue
+        for m in msgs:
+            v, why = tri.classify(m, ctx)
+            counts[v] += 1
+            if v in ("urgent", "consider") or "-v" in args:
+                print(f"  {v:9} [{why[:40]:42}] {(m.get('subject') or '')[:56]}")
+    total = sum(counts.values()) or 1
+    free = counts["digest"] + counts["ignore"]
+    print(f"\n{total} messages: urgent {counts['urgent']}, consider {counts['consider']}, "
+          f"digest {counts['digest']}, ignore {counts['ignore']}")
+    print(f"{free / total * 100:.0f}% never reaches a model; "
+          f"{counts['urgent'] / total * 100:.0f}% goes straight to the expensive one")
     return 0
 
 
@@ -202,6 +287,15 @@ def cmd_status(args):
         print(f"    tcc        {call('status', timeout=15)}")
     except SynthdError as e:
         print(f"    UNREACHABLE {e}")
+    print("budget")
+    from synth import budget
+    for line in budget.summary(conn).splitlines():
+        print(f"    {line}")
+    print("mail filter")
+    d = conn.execute("SELECT COUNT(*) FROM mail_digest WHERE reported_at IS NULL").fetchone()[0]
+    pol = dict(conn.execute("SELECT policy, COUNT(*) FROM sender_policy GROUP BY policy"))
+    print(f"    digest queue  {d} message(s) awaiting the next brief")
+    print(f"    senders       {pol}")
     print("runs")
     for r in conn.execute("SELECT job, status, started_at, summary FROM run_log "
                           "ORDER BY id DESC LIMIT 5"):
@@ -213,7 +307,8 @@ def cmd_status(args):
 COMMANDS = {
     "watch": cmd_watch, "react": cmd_react, "brief": cmd_brief, "index": cmd_index,
     "ocr": cmd_ocr, "enrich": cmd_enrich, "notes": cmd_notes, "reconcile": cmd_reconcile, "call": cmd_call, "serve": cmd_serve, "log": cmd_log, "why": cmd_why,
-    "undo": cmd_undo, "status": cmd_status,
+    "undo": cmd_undo, "status": cmd_status, "budget": cmd_budget,
+    "triage": cmd_triage,
 }
 
 

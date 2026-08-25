@@ -4,3 +4,6 @@ bin/Synth.app/
 __pycache__/
 *.pyc
 synth.db
+# WAL sidecars hold committed pages of the same database.
+synth.db-shm
+synth.db-wal
