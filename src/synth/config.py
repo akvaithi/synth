@@ -37,6 +37,27 @@ MANAGED_CALENDARS = ["Personal", "Semester Calendar", "College Events", "Meeting
 # Where an event goes when the caller does not name a calendar.
 DEFAULT_CALENDAR = "Personal"
 
+# ---------------------------------------------------------------- document writes
+#
+# The one folder Synth may write files in, relative to DOCUMENTS_ROOT. Everything else under
+# Documents is read-only, the same way MANAGED_LISTS works for Reminders.
+WRITABLE_DOCUMENTS = "Archive/Consort/markdown"
+
+# Files inside that folder that stay read-only. These are what enrich.py feeds to a model to
+# extract facts from -- PRIORITY_PATTERNS[0] is exactly 'Archive/Consort/markdown/%' -- and
+# they are what Synth is told about itself. A system that can edit its own instructions and
+# then read them back as evidence is one that can talk itself into anything.
+PROTECTED_DOCUMENTS = ["self.md", "corrections.md", "patterns.md", "CLAUDE.md", "CONTEXT.md"]
+
+# Extensions Synth may write. Only extract.PLAIN round-trips losslessly; a .docx or .pdf is
+# extracted through MarkItDown or PDFKit and writing one back would destroy its formatting.
+WRITABLE_EXTENSIONS = [".md", ".markdown", ".txt"]
+
+# The largest file Synth will rewrite in one piece. Deliberately equal to extract.MAX_CHARS:
+# above it, extract() truncates, so the indexed copy would be a partial view of a whole file
+# and an anchored replace could not be checked against the text that is actually on disk.
+MAX_DOCUMENT_BYTES = 200_000
+
 # ---------------------------------------------------------------- cost control
 #
 # Ceilings on model spend, in the API-equivalent dollars the CLI reports per run. These are

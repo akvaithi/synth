@@ -85,6 +85,14 @@ def migrate(conn) -> list[str]:
         if col not in cols:
             conn.execute(f"ALTER TABLE mail_digest ADD COLUMN {col} {decl}")
             done.append(f"mail_digest: added {col}")
+    # before/after record what the file looked like, which is enough to undo a write but not
+    # enough to explain one. A document write logged as an append that behaved like a
+    # replacement could not be diagnosed after the fact, because nothing recorded the
+    # arguments the tool was actually handed.
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(action_log)")}
+    if "args_json" not in cols:
+        conn.execute("ALTER TABLE action_log ADD COLUMN args_json TEXT")
+        done.append("action_log: added args_json")
     if done:
         conn.commit()
     # run_log.status gained 'skipped'. SQLite cannot alter a CHECK constraint, so the table
@@ -160,16 +168,38 @@ def run(conn, job: str, trigger: str | None = None):
         conn.commit()
 
 
+ARG_VALUE_LIMIT = 4000
+
+
+def _trim_args(args: dict) -> dict:
+    """Record what a tool was asked to do without keeping a second copy of the file.
+
+    A whole-file append would otherwise put its entire text in the audit log. The head of a
+    string is what identifies an edit; the truncation is marked so a reader never mistakes a
+    shortened value for the real argument.
+    """
+    out = {}
+    for k, v in args.items():
+        if isinstance(v, str) and len(v) > ARG_VALUE_LIMIT:
+            out[k] = v[:ARG_VALUE_LIMIT] + f"... [{len(v) - ARG_VALUE_LIMIT} more chars]"
+        else:
+            out[k] = v
+    return out
+
+
 def log_action(conn, action: str, target_kind: str, reason: str, *,
                run_id: int | None = None, target_id: str | None = None,
-               evidence_id: int | None = None, before=None, after=None) -> int:
+               evidence_id: int | None = None, before=None, after=None,
+               args: dict | None = None) -> int:
     """Record a mutation. `reason` is required — an unexplained write is a bug."""
     cur = conn.execute(
         "INSERT INTO action_log (run_id, action, target_kind, target_id, reason, "
-        "evidence_id, before_json, after_json) VALUES (?,?,?,?,?,?,?,?) RETURNING id",
+        "evidence_id, before_json, after_json, args_json) VALUES (?,?,?,?,?,?,?,?,?) "
+        "RETURNING id",
         (run_id, action, target_kind, target_id, reason, evidence_id,
          json.dumps(before) if before is not None else None,
-         json.dumps(after) if after is not None else None),
+         json.dumps(after) if after is not None else None,
+         json.dumps(_trim_args(args)) if args is not None else None),
     )
     action_id = cur.fetchone()[0]
     conn.commit()
@@ -196,6 +226,24 @@ REVERSALS = {
 }
 
 
+# Not everything is reversed by a synthd call. A file write is undone by putting the previous
+# bytes back and reindexing, which is Python, not AppleScript. Rather than widen REVERSALS
+# into a two-shaped table, these get their own: same dispatch, same before_json contract, a
+# different executor. Each takes (conn, before) and returns a sentence for the caller.
+def _restore_document(conn, before):
+    # Local import: docwrite imports db, so this cycle is real. Mirrors the local applekit
+    # import in undo() below.
+    from synth import docwrite
+
+    return docwrite.restore(conn, before)
+
+
+PY_REVERSALS = {
+    "update_document": _restore_document,
+    "append_document": _restore_document,
+}
+
+
 def undo(conn, action_id: int) -> str:
     """Reverse one logged action. Creations are not reversed — Synth never deletes."""
     from synth.applekit import call
@@ -207,6 +255,13 @@ def undo(conn, action_id: int) -> str:
         raise KeyError(f"no action {action_id}")
     if row["undone_at"]:
         return f"action {action_id} was already undone at {row['undone_at']}"
+    if row["action"] in PY_REVERSALS:
+        if not row["before_json"]:
+            return f"action {action_id} has no recorded prior state, so it cannot be reversed"
+        detail = PY_REVERSALS[row["action"]](conn, json.loads(row["before_json"]))
+        conn.execute("UPDATE action_log SET undone_at = ? WHERE id = ?", (now(), action_id))
+        conn.commit()
+        return f"reversed action {action_id}: {detail}"
     if row["action"] not in REVERSALS:
         if row["action"].startswith("create_"):
             return (f"action {action_id} created a {row['target_kind']}; Synth never deletes. "

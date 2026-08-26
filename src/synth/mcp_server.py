@@ -58,7 +58,10 @@ def list_obligations(status: str = "open", limit: int = 100) -> str:
 
 
 def read_document(doc_id: int = 0, path: str = "", max_chars: int = 20000) -> str:
-    """Full extracted text of one ingested file, by id or by path relative to Documents."""
+    """Full extracted text of one ingested file, by id or by path relative to Documents.
+
+    When `truncated` comes back true you have not seen the whole file — you may still edit a
+    passage you did see, but you do not know what is at the end of it."""
     return _j(_with_conn(lambda c: tools.read_document(c, doc_id or None,
                                                        path or None, max_chars)))
 
@@ -289,6 +292,52 @@ def draft_email(to: list[str], subject: str, body: str, reason: str,
         c, to=to, subject=subject, body=body, reason=reason, account=account)))
 
 
+def update_document(path: str, old: str, new: str, reason: str) -> str:
+    """Replace one exact passage in one of Arun's markdown files. This writes the FILE, on
+    disk, in iCloud — it syncs to his phone. It is a real edit, not a database note.
+
+    Only Archive/Consort/markdown/ is writable. Inside it, self.md, corrections.md,
+    patterns.md, CLAUDE.md and CONTEXT.md are read-only.
+
+    `old` is the exact text to replace and MUST appear exactly once. Copy it verbatim from
+    read_document, including line breaks and punctuation. Zero matches and two matches are
+    both refused and nothing is written — extend `old` with the line above it until it is
+    unique. `new` replaces it; pass "" to remove the passage, and only when Arun asked for
+    that in those words.
+
+    There is deliberately no way to replace a whole document. read_document truncates, and a
+    tool that accepted a whole file would let a partial read silently destroy the rest.
+
+    `reason` is required and recorded. The previous version of the file is kept; undo with
+    the returned action_id puts it back."""
+    return _j(_with_conn(lambda c: tools.update_document(
+        c, path=path, old=old, new=new, reason=reason)))
+
+
+def append_document(path: str, text: str, reason: str) -> str:
+    """Add text to the end of one of Arun's markdown files, after a blank line. Nothing
+    already in the file is touched, so this is the safe way to add an entry, a row or a new
+    section. Same writable folder and same read-only files as update_document.
+
+    `reason` is required and recorded; undo removes the addition."""
+    return _j(_with_conn(lambda c: tools.append_document(
+        c, path=path, text=text, reason=reason)))
+
+
+def create_document(path: str, text: str, reason: str) -> str:
+    """Create a NEW file under Archive/Consort/markdown/. Refused if the path already exists
+    — use update_document to change a passage, or append_document to add to the end.
+
+    `path` is relative to Documents and must end in .md, .markdown or .txt. The file is
+    indexed immediately, so search_context finds it in the same conversation, and it syncs
+    to his phone.
+
+    A file Synth created cannot be undone away — Synth never deletes. undo will say so and
+    name the file for Arun to remove himself. Be correspondingly deliberate."""
+    return _j(_with_conn(lambda c: tools.create_document(
+        c, path=path, text=text, reason=reason)))
+
+
 def undo(action_id: int) -> str:
     """Reverse one logged action by its id, restoring the prior state."""
     return _j(_with_conn(lambda c: tools.undo(c, action_id)))
@@ -300,6 +349,7 @@ READ_TOOLS = [search_context, get_entity, fact_history, list_obligations, read_d
 WRITE_TOOLS = [add_facts, create_reminder, complete_reminder, update_reminder,
                create_event, update_event,
                update_obligation, draft_email, accept_correction, retract_reminder,
+               update_document, append_document, create_document,
                undo]
 
 

@@ -8,11 +8,8 @@ from __future__ import annotations
 
 import os
 
-from synth import actions, config, db, facts
+from synth import actions, config, db, docwrite, facts, ingest
 from synth.applekit import call
-
-TEXT_CACHE = os.path.expanduser("~/Developer/synth/.state/text")
-DOCUMENTS = os.path.expanduser(config.DOCUMENTS_ROOT)
 
 
 def _fts_escape(q: str) -> str:
@@ -483,6 +480,140 @@ def accept_correction(conn, doc: str, reason: str, run_id=None) -> dict:
                   target_id=row["note_id"])
     conn.commit()
     return {"doc": doc, "accepted": True}
+
+
+def update_document(conn, path: str, old: str, new: str, reason: str, run_id=None) -> dict:
+    """Replace one exact passage in one of Arun's files, on disk, where his phone sees it.
+
+    `old` must appear exactly once. Zero matches and two matches are both refused and
+    nothing is written, and that refusal is the whole safety mechanism: read_document
+    truncates at max_chars and extract._clean truncates at 200,000, so a tool that accepted
+    "the whole updated document" would let a model that had seen only the first 20,000
+    characters silently delete the rest. An anchored replace cannot lose text it never saw,
+    which is why there is no full-replace tool and none may be added.
+    """
+    # Before anything that can return or raise early — see the comment in create_reminder
+    # for the bug that comes of checking the reason after the first early return.
+    actions._require_reason(reason)
+    if not old:
+        raise ValueError(
+            "old is required: paste the exact passage to replace, copied verbatim from "
+            "read_document, including its punctuation and line breaks. update_document "
+            "never replaces a whole file — that is how a truncated read destroys the tail.")
+    if old == new:
+        raise ValueError(
+            "old and new are identical, so this write would change nothing. Never write to "
+            "Arun's files to check how a tool behaves.")
+
+    abs_path = docwrite.resolve(path)
+    rel_path = docwrite.relative(abs_path)
+    if not os.path.exists(abs_path):
+        raise ValueError(
+            f"{path!r} does not exist under Documents. Use create_document to make a new "
+            f"file, or read_document to check the path you have.")
+
+    text = docwrite.read_current(rel_path, abs_path)
+    count = text.count(old)
+    if count == 0:
+        # Whitespace is the failure a model actually hits, so say so when that is the cause
+        # rather than leaving it to guess at invisible characters.
+        hint = ""
+        if " ".join(text.split()).count(" ".join(old.split())) == 1:
+            hint = (" The passage IS in the file but with different whitespace — copy it "
+                    "exactly as read_document returned it, including line breaks and "
+                    "indentation.")
+        raise ValueError(
+            f"the passage was not found in {path!r}. It must match byte for byte, including "
+            f"line breaks, indentation, and the exact dashes and quote marks. Nothing was "
+            f"written. Re-read the file with read_document and copy the passage from what "
+            f"it returned." + hint)
+    if count > 1:
+        raise ValueError(
+            f"the passage appears {count} times in {path!r}, so Synth cannot tell which one "
+            f"you mean. Nothing was written. Extend `old` upward with the line or heading "
+            f"above it until it is unique.")
+
+    new_text = text.replace(old, new, 1)
+    if len(new_text.encode("utf-8")) > config.MAX_DOCUMENT_BYTES:
+        raise ValueError(
+            f"the result would be {len(new_text.encode('utf-8')):,} bytes, over the "
+            f"{config.MAX_DOCUMENT_BYTES:,}-byte limit. Nothing was written.")
+
+    action_id, index = actions.write_document(
+        conn, action="update_document", rel_path=rel_path, abs_path=abs_path, text=new_text,
+        reason=reason, expect_hash=ingest.file_hash(abs_path), run_id=run_id,
+        args={"path": path, "old": old, "new": new, "occurrences_replaced": 1})
+    return {"written": True, "action_id": action_id, "path": rel_path,
+            "document_id": index["document_id"],
+            "chars_before": len(text), "chars_after": len(new_text),
+            "undo": f"undo({action_id}) puts the previous version back"}
+
+
+def append_document(conn, path: str, text: str, reason: str, run_id=None) -> dict:
+    """Add text to the end of one of Arun's files, after a blank line.
+
+    Nothing already in the file is touched, so this is the safe way to add an entry, a row
+    or a new section.
+    """
+    actions._require_reason(reason)
+    if not text or not text.strip():
+        raise ValueError(
+            f"text is required: append_document adds text to the end of {path!r}, and there "
+            f"is nothing here to add.")
+
+    abs_path = docwrite.resolve(path)
+    rel_path = docwrite.relative(abs_path)
+    if not os.path.exists(abs_path):
+        raise ValueError(
+            f"{path!r} does not exist under Documents. Use create_document to make a new "
+            f"file, or read_document to check the path you have.")
+
+    current = docwrite.read_current(rel_path, abs_path)
+    new_text = current.rstrip("\n") + "\n\n" + text.strip() + "\n"
+    if len(new_text.encode("utf-8")) > config.MAX_DOCUMENT_BYTES:
+        raise ValueError(
+            f"the result would be {len(new_text.encode('utf-8')):,} bytes, over the "
+            f"{config.MAX_DOCUMENT_BYTES:,}-byte limit. Nothing was written.")
+
+    action_id, index = actions.write_document(
+        conn, action="append_document", rel_path=rel_path, abs_path=abs_path, text=new_text,
+        reason=reason, expect_hash=ingest.file_hash(abs_path), run_id=run_id,
+        args={"path": path, "text": text})
+    return {"written": True, "action_id": action_id, "path": rel_path,
+            "document_id": index["document_id"],
+            "chars_before": len(current), "chars_after": len(new_text),
+            "undo": f"undo({action_id}) removes the addition"}
+
+
+def create_document(conn, path: str, text: str, reason: str, run_id=None) -> dict:
+    """Create a new file. Refuses to overwrite anything that already exists."""
+    actions._require_reason(reason)
+    if not text or not text.strip():
+        raise ValueError("text is required: create_document will not create an empty file.")
+
+    abs_path = docwrite.resolve(path)
+    rel_path = docwrite.relative(abs_path)
+    if os.path.exists(abs_path):
+        raise FileExistsError(
+            f"{path!r} already exists. create_document never overwrites — use "
+            f"update_document to change a passage, or append_document to add to the end.")
+    # An evicted file is not visible to os.path.exists under its own name; iCloud leaves a
+    # hidden .name.icloud stub in its place. Without this check create_document would
+    # silently clobber a file whose contents are merely off the machine.
+    stub = os.path.join(os.path.dirname(abs_path), "." + os.path.basename(abs_path) + ".icloud")
+    if os.path.exists(stub):
+        raise FileExistsError(
+            f"{path!r} exists but its contents are evicted from this machine by iCloud. "
+            f"create_document never overwrites. Read it first so iCloud downloads it, then "
+            f"use update_document.")
+
+    action_id, index = actions.write_document(
+        conn, action="create_document", rel_path=rel_path, abs_path=abs_path,
+        text=text if text.endswith("\n") else text + "\n", reason=reason, run_id=run_id,
+        args={"path": path, "text": text})
+    return {"created": True, "action_id": action_id, "path": rel_path,
+            "document_id": index["document_id"], "chars": index["chars"],
+            "note": "Synth never deletes; a file it created has to be removed by hand"}
 
 
 def mail_links(conn, account: str, index: int, messageId: str, mailbox: str = "INBOX") -> dict:

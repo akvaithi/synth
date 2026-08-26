@@ -47,6 +47,9 @@ WRITE = {
     "draft_email": tools.draft_email,
     "accept_correction": tools.accept_correction,
     "retract_reminder": tools.retract_reminder,
+    "update_document": tools.update_document,
+    "append_document": tools.append_document,
+    "create_document": tools.create_document,
     "undo": tools.undo,
 }
 

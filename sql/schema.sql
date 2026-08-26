@@ -123,6 +123,7 @@ CREATE TABLE IF NOT EXISTS action_log (
     evidence_id   INTEGER REFERENCES source(id),  -- the mail that justified it
     before_json   TEXT,                   -- prior state, for undo
     after_json    TEXT,
+    args_json     TEXT,                   -- what the tool was actually asked to do
     undone_at     TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_action_at ON action_log (at DESC);
