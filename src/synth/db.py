@@ -37,6 +37,40 @@ def local(ts: str | None, fmt: str = "%Y-%m-%d %H:%M") -> str:
     return dt.astimezone().strftime(fmt)
 
 
+# Long enough to be unambiguous on its own. The date is not decoration: converting from UTC
+# moves the day for anything after 7pm local, which is how a reminder due Wednesday 7:15 PM
+# was read off a "2026-08-27T00:15:00Z" and reported as Thursday.
+LOCAL_FMT = "%a %Y-%m-%d %-I:%M %p"
+
+
+def tzname() -> str:
+    """The zone the _local renderings are in, so a reader never has to assume."""
+    return datetime.now().astimezone().tzname()
+
+
+def localize(rows, *keys):
+    """Add a readable local rendering beside each UTC timestamp handed to a model.
+
+    The daemon speaks UTC with a Z suffix, which is right for comparing and storing and wrong
+    for reading. Anything that hands a time to a model now carries both: the ISO value, which
+    is what arithmetic and writes must keep using, and a `_local` string to quote to Arun.
+
+    Asking a model to do the conversion itself is not a small ask made once -- it is the same
+    ask on every row of every brief, and it only has to be forgotten once. On 2026-08-25 it
+    was: a 1:50 PM class was reported at 6:50 PM, a 4:10 PM class at 9:10 PM, and a 10:00 AM
+    lab visit at 3:00 PM, while a reminder in the same brief converted correctly. That mix is
+    the signature of arithmetic done by hand.
+    """
+    for it in (rows if isinstance(rows, list) else [rows]):
+        if not isinstance(it, dict):
+            continue
+        for k in keys:
+            v = it.get(k)
+            if isinstance(v, str) and v:
+                it[f"{k}_local"] = local(v, LOCAL_FMT)
+    return rows
+
+
 def text_hash(s: str) -> str:
     """Hash of normalised text: whitespace-collapsed, so trivial reflow is not an edit."""
     normalised = " ".join(s.split())

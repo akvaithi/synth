@@ -82,11 +82,11 @@ def fact_history(conn, name: str, predicate: str) -> dict:
 
 
 def list_obligations(conn, status: str = "open", limit: int = 100) -> list[dict]:
-    return [dict(r) for r in conn.execute(
+    return db.localize([dict(r) for r in conn.execute(
         "SELECT o.id, o.title, o.due, o.status, o.externally_set, o.ek_identifier, "
         "  e.name AS entity FROM obligation o LEFT JOIN entity e ON e.id = o.entity_id "
         "WHERE (? = 'all' OR o.status = ?) ORDER BY o.due IS NULL, o.due LIMIT ?",
-        (status, status, limit))]
+        (status, status, limit))], "due")
 
 
 def read_document(conn, doc_id: int = None, path: str = None, max_chars: int = 20000) -> dict:
@@ -103,22 +103,46 @@ def read_document(conn, doc_id: int = None, path: str = None, max_chars: int = 2
 
 def today(conn) -> dict:
     return {
-        "events": call("events", days=1, timeout=120),
-        "reminders": call("reminders", timeout=180),
+        "timezone": db.tzname(),
+        "events": db.localize(call("events", days=1, timeout=120), "start", "end", "lastModified"),
+        "reminders": db.localize(call("reminders", timeout=180), "due", "lastModified"),
     }
 
 
+def _unpack_state(d: dict) -> dict:
+    """Return the before/after blobs as objects with their times localised.
+
+    The audit surface is read straight into the brief's "what Synth did" section, and the
+    times that matter there -- when a reminder it created is actually due -- live inside these
+    JSON strings, where localize cannot reach them. Handed over as raw UTC they get converted
+    by hand and land a day out: a reminder due Thursday 7pm was reported as Wednesday.
+    """
+    import json as _json
+    for key in ("before_json", "after_json", "args_json"):
+        raw = d.get(key)
+        if not raw:
+            continue
+        try:
+            obj = _json.loads(raw)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(obj, dict):
+            db.localize(obj, "due", "start", "end", "at")
+        d[key[:-5]] = obj
+    return d
+
+
 def activity(conn, limit: int = 50) -> list[dict]:
-    return [dict(r) for r in conn.execute(
+    return db.localize([dict(r) for r in conn.execute(
         "SELECT id, at, action, target_kind, target_id, reason, undone_at "
-        "FROM action_log ORDER BY id DESC LIMIT ?", (limit,))]
+        "FROM action_log ORDER BY id DESC LIMIT ?", (limit,))], "at", "undone_at")
 
 
 def why(conn, action_id: int) -> dict:
     row = conn.execute("SELECT * FROM action_log WHERE id = ?", (action_id,)).fetchone()
     if row is None:
         return {"found": False}
-    d = dict(row)
+    d = _unpack_state(db.localize(dict(row), "at", "undone_at"))
     if d.get("evidence_id"):
         ev = conn.execute("SELECT kind, native_id, detail FROM source WHERE id = ?",
                           (d["evidence_id"],)).fetchone()

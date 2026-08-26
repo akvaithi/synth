@@ -11,6 +11,7 @@ from __future__ import annotations
 import re
 from datetime import datetime, timedelta, timezone
 
+from synth import db
 from synth.applekit import call
 
 STOP = {"the", "a", "an", "with", "and", "for", "of", "to", "at", "on", "in", "session",
@@ -60,11 +61,14 @@ def agenda(date: str) -> dict:
             reminders.append(r)
     return {
         "date": date,
-        "events": [{"title": e["title"], "start": e["start"], "end": e["end"],
-                    "allDay": e["allDay"], "calendar": e["calendar"], "id": e["id"]}
-                   for e in events],
-        "reminders": [{"title": r["title"], "due": r["due"], "list": r["list"], "id": r["id"]}
-                      for r in reminders],
+        "timezone": db.tzname(),
+        "events": db.localize(
+            [{"title": e["title"], "start": e["start"], "end": e["end"],
+              "allDay": e["allDay"], "calendar": e["calendar"], "id": e["id"]}
+             for e in events], "start", "end"),
+        "reminders": db.localize(
+            [{"title": r["title"], "due": r["due"], "list": r["list"], "id": r["id"]}
+             for r in reminders], "due"),
     }
 
 
@@ -95,6 +99,7 @@ def already_scheduled(title: str, when: str, window_minutes: int = 240) -> dict:
                              "minutes_apart": round(delta), "shared_words": sorted(shared),
                              "id": it["id"]})
     hits.sort(key=lambda h: h["minutes_apart"])
+    db.localize(hits, "when")
     return {"checked": True, "date": date, "matches": hits,
             "verdict": "likely already scheduled" if hits else "nothing similar found"}
 
@@ -118,7 +123,10 @@ def conflicts(start: str, minutes: int = 30) -> dict:
         d = _parse(r["due"])
         if d and abs((d - s).total_seconds()) < 15 * 60:
             out.append({"kind": "reminder", "title": r["title"], "due": r["due"]})
-    return {"checked": True, "proposed": start, "minutes": minutes, "conflicts": out}
+    db.localize(out, "start", "end", "due")
+    return db.localize(
+        {"checked": True, "proposed": start, "minutes": minutes, "conflicts": out},
+        "proposed")
 
 
 def find_free_slot(date: str, minutes: int = 30, earliest_hour: int = 8,
@@ -146,8 +154,9 @@ def find_free_slot(date: str, minutes: int = 30, earliest_hour: int = 8,
         end = cursor + need
         clash = next((b for b in busy if b[0] < end and cursor < b[1]), None)
         if clash is None:
-            return {"date": date, "slot": _iso(cursor), "local": cursor.strftime("%H:%M"),
-                    "minutes": minutes}
+            return {"date": date, "slot": _iso(cursor),
+                    "slot_local": cursor.strftime(db.LOCAL_FMT),
+                    "timezone": db.tzname(), "minutes": minutes}
         cursor = clash[1].astimezone()
     return {"date": date, "slot": None,
             "reason": f"no free {minutes}-minute window between "
