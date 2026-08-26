@@ -141,7 +141,7 @@ def snapshot(rel_path: str, abs_path: str) -> dict | None:
 
 
 def _write_bytes(abs_path: str, data: bytes) -> None:
-    """Atomic replace: the watcher._save idiom, with two additions for an iCloud folder.
+    """Atomic replace, with two additions for an iCloud folder.
 
     The temp name leads with a dot so ingest.candidates() skips it — it skips anything
     starting with '.' — which means a crash between write and replace can never leave behind

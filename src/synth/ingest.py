@@ -16,7 +16,10 @@ import time
 from synth import config, db
 from synth.extract import extract, ExtractionError, SKIP
 
-DOCUMENTS = os.path.expanduser(config.DOCUMENTS_ROOT)
+# realpath, not just expanduser: docwrite.resolve() hands back a fully resolved path, and
+# relpath against a differently-spelled root yields a "../../.." native_id and a second
+# source row for a file already indexed. The two roots have to be spelled the same way.
+DOCUMENTS = os.path.realpath(os.path.expanduser(config.DOCUMENTS_ROOT))
 TEXT_CACHE = os.path.expanduser("~/Developer/synth/.state/text")
 
 # Directories that are noise for a personal-context database.

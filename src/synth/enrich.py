@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import os
 
-from synth import db, reactor
+from synth import db, runner
 
 # Documents worth a model's attention, most authoritative first. Everything else is left to
 # full-text search, which is enough for "what did I write about X".
@@ -31,10 +31,11 @@ PRIORITY_PATTERNS = [
 EXCLUDE_SUBSTRINGS = ["Workshop", "Career Center", ".url", "other students",
                       "Goldwater Examples", "Sample"]
 
-ENRICH_TOOLS = [
-    "mcp__synth__search_context", "mcp__synth__get_entity", "mcp__synth__read_document",
-    "mcp__synth__fact_history", "mcp__synth__add_facts",
-]
+# Reached through `synth call`, not MCP. These were mcp__synth__* names until the VM side
+# stopped loading MCP servers on 2026-08-23 (--strict-mcp-config with no --mcp-config loads
+# none at all). Enrichment asked for tools that no longer existed from that day until this
+# one; it last ran successfully on 2026-08-21 and nothing noticed, because nothing ran it.
+ENRICH_TOOLS = list(runner.DIRECT_TOOLS)
 
 
 def select(conn, extra_limit: int = 0) -> list[dict]:
@@ -91,8 +92,8 @@ def run(conn, docs: list[dict], dry_run: bool = False) -> list[dict]:
             print(listing)
             continue
         with db.run(conn, "enrich", trigger=f"batch {i}/{len(groups)}") as run_id:
-            prompt = reactor._prompt("enrich", documents=listing)
-            res = reactor.run_claude(prompt, ENRICH_TOOLS, max_turns=60, timeout=2400)
+            prompt = runner.prompt("enrich", documents=listing)
+            res = runner.run_claude(prompt, ENRICH_TOOLS, max_turns=60, timeout=2400)
             summary = str(res.get("result", ""))[:3000]
             conn.execute("UPDATE run_log SET summary = ? WHERE id = ?", (summary, run_id))
             if not res.get("is_error"):
