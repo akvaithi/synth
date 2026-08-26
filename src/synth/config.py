@@ -82,8 +82,18 @@ def _money(name: str, default: float) -> float:
     except ValueError:
         return default
 
-# The rolling 5-hour window is the limit that actually bites day to day.
-BUDGET_5H = _money("SYNTH_BUDGET_5H", 1.40)
+# Retuned 2026-08-25 against the first real week, which is what these were always waiting
+# for. At the old ceilings the arithmetic left no room: both briefs cost about $1.08 and the
+# reactor's share after the day reserve was $1.10, against a $2.20 day ceiling -- roughly two
+# cents of slack. On 2026-08-25 that produced 1,355 skipped runs out of 1,372, the reactor
+# spent its whole day's share in four runs before noon, and the day ceiling then refused the
+# evening brief at 20:20 ("last 24h spend $2.35 has reached $2.20"). The reserve protects the
+# briefs from the reactor but not from the total, and the evening brief, being last, is
+# always what the total squeezes out.
+#
+# The rolling 5-hour window is the limit that actually bites day to day. At $1.40 with $1.00
+# reserved the reactor got $0.40 -- one run per five hours.
+BUDGET_5H = _money("SYNTH_BUDGET_5H", 2.00)
 # Held back from everything except the brief, so the 06:50 brief is never the run that
 # discovers the window is empty. The brief is what Arun reads; the reactor is the expense.
 # Each reserve is sized to the briefs that window still owes him -- one in five hours, both
@@ -92,7 +102,7 @@ BUDGET_5H = _money("SYNTH_BUDGET_5H", 1.40)
 BUDGET_5H_RESERVE = _money("SYNTH_BUDGET_5H_RESERVE", 1.00)
 BUDGET_DAY_RESERVE = _money("SYNTH_BUDGET_DAY_RESERVE", 1.10)
 BUDGET_MONTH_RESERVE = _money("SYNTH_BUDGET_MONTH_RESERVE", 8.00)
-BUDGET_DAY = _money("SYNTH_BUDGET_DAY", 2.20)
+BUDGET_DAY = _money("SYNTH_BUDGET_DAY", 4.00)
 BUDGET_MONTH = _money("SYNTH_BUDGET_MONTH", 55.00)
 
 # Ordinary mail waits this long so a batch is judged in one run instead of one run per
