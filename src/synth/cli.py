@@ -119,11 +119,17 @@ def cmd_sync(args):
     except Exception as e:
         out["detect"] = f"{type(e).__name__}: {e}"
 
-    # Documents. Free. Only files touched since the last sweep, unless --full.
+    # Documents. Free. Only files touched since the last sweep, unless --full -- plus
+    # anything that failed last time, which the mtime filter would otherwise skip forever.
     try:
-        out["ingest"] = ingest.scan(conn, since=None if full else since)
+        retry = [] if full else [p for p in mark.get("retry", []) if os.path.exists(p)]
+        res = ingest.scan(conn, since=None if full else since, extra=retry)
+        out["ingest"] = {k: v for k, v in res.items() if k != "failed_paths"}
+        if retry:
+            out["ingest"]["retried"] = len(retry)
         out["index"] = indexer.build(conn)
-        _save_json(SYNC_MARK, {"last_sweep": started})
+        _save_json(SYNC_MARK, {"last_sweep": started,
+                               "retry": res.get("failed_paths", [])})
     except Exception as e:
         out["documents"] = f"{type(e).__name__}: {e}"
 

@@ -103,11 +103,14 @@ def ingest_file(conn, path: str) -> tuple[str, int]:
 
 
 def scan(conn, limit: int | None = None, progress_every: int = 100,
-         since: float | None = None) -> dict:
+         since: float | None = None, extra: list[str] | None = None) -> dict:
     files = candidates(since=since)
+    if extra:
+        files = sorted(set(files) | set(extra))
     if limit:
         files = files[:limit]
     stats = {"total": len(files), "extracted": 0, "cached": 0, "failed": 0, "chars": 0}
+    failed_paths: list[str] = []
     failures: dict[str, int] = {}
     t0 = time.time()
     for i, path in enumerate(files, 1):
@@ -119,6 +122,7 @@ def scan(conn, limit: int | None = None, progress_every: int = 100,
             stats["chars"] += chars
         else:
             stats["failed"] += 1
+            failed_paths.append(path)
             reason = status.split(":", 1)[1].strip()[:60] if ":" in status else status
             failures[reason] = failures.get(reason, 0) + 1
         if i % progress_every == 0:
@@ -129,5 +133,9 @@ def scan(conn, limit: int | None = None, progress_every: int = 100,
                   f"failed={stats['failed']}", flush=True)
     conn.commit()
     stats["failure_reasons"] = sorted(failures.items(), key=lambda kv: -kv[1])[:12]
+    # Named, not just counted. A sweep that filters on mtime would otherwise advance its
+    # watermark past a file that failed and never look at it again -- an iCloud file evicted
+    # at the wrong moment would be silently missing from the index forever.
+    stats["failed_paths"] = failed_paths[:200]
     stats["seconds"] = round(time.time() - t0, 1)
     return stats
