@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>page.akvaithi.synth.sync</string>
+    <!-- Documents, obligations, mail index, Notes mirror. Free except the Haiku pass over
+         subject lines the static rules could not settle. Thirty minutes matches
+         MAIL_BATCH_SECONDS: a batch of twelve subjects costs barely more than a batch of
+         one, so sweeping less often is also cheaper per message. -->
+    <key>StartInterval</key><integer>1800</integer>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/akvaithi/Developer/synth/bin/synth</string>
+        <string>sync</string>
+    </array>
+    <key>WorkingDirectory</key><string>/Users/akvaithi/Developer/synth</string>
+    <key>StandardOutPath</key><string>/Users/akvaithi/Developer/synth/.state/sync.out.log</string>
+    <key>StandardErrorPath</key><string>/Users/akvaithi/Developer/synth/.state/sync.err.log</string>
+    <key>RunAtLoad</key><false/>
+</dict>
+</plist>

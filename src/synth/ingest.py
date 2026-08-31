@@ -38,7 +38,14 @@ def file_hash(path: str, limit: int = 8 * 1024 * 1024) -> str:
     return h.hexdigest()[:32]
 
 
-def candidates() -> list[str]:
+def candidates(since: float | None = None) -> list[str]:
+    """Files worth ingesting. With `since`, only those modified after that epoch time.
+
+    A full pass hashes every file, and on an iCloud-backed folder that is not cheap: 1,919
+    files took 582 seconds, which is longer than the sweep interval it was meant to run
+    inside. Nothing changes content without changing mtime, so the sweep filters on the stat
+    it was already making for the size check and the steady-state pass costs almost nothing.
+    """
     """Every file under Documents worth trying to read."""
     out = []
     for root, dirs, files in os.walk(DOCUMENTS):
@@ -51,9 +58,12 @@ def candidates() -> list[str]:
                 continue
             path = os.path.join(root, name)
             try:
-                if os.path.getsize(path) > MAX_BYTES:
-                    continue
+                st = os.stat(path)
             except OSError:
+                continue
+            if st.st_size > MAX_BYTES:
+                continue
+            if since is not None and st.st_mtime <= since:
                 continue
             out.append(path)
     return sorted(out)
@@ -92,8 +102,9 @@ def ingest_file(conn, path: str) -> tuple[str, int]:
     return "extracted", len(text)
 
 
-def scan(conn, limit: int | None = None, progress_every: int = 100) -> dict:
-    files = candidates()
+def scan(conn, limit: int | None = None, progress_every: int = 100,
+         since: float | None = None) -> dict:
+    files = candidates(since=since)
     if limit:
         files = files[:limit]
     stats = {"total": len(files), "extracted": 0, "cached": 0, "failed": 0, "chars": 0}

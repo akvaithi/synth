@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>page.akvaithi.synth.enrich</string>
+    <!-- The one scheduled model pass. Drains whatever documents are new; on an ordinary
+         day that is nothing at all and it exits without spending. Runs at 03:00 so a large
+         drop is paid for overnight rather than while he is working. -->
+    <key>StartCalendarInterval</key>
+    <dict><key>Hour</key><integer>3</integer><key>Minute</key><integer>0</integer></dict>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/akvaithi/Developer/synth/bin/synth</string>
+        <string>enrich</string>
+    </array>
+    <key>WorkingDirectory</key><string>/Users/akvaithi/Developer/synth</string>
+    <key>StandardOutPath</key><string>/Users/akvaithi/Developer/synth/.state/enrich.out.log</string>
+    <key>StandardErrorPath</key><string>/Users/akvaithi/Developer/synth/.state/enrich.err.log</string>
+    <key>RunAtLoad</key><false/>
+</dict>
+</plist>

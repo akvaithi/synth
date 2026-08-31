@@ -102,7 +102,7 @@ CREATE TABLE IF NOT EXISTS link (
 
 CREATE TABLE IF NOT EXISTS run_log (
     id            INTEGER PRIMARY KEY,
-    job           TEXT NOT NULL,          -- enrich / ingest / manual
+    job           TEXT NOT NULL,          -- brief / reactor / watch / interview / manual
     trigger       TEXT,                   -- what caused it
     started_at    TEXT NOT NULL DEFAULT (datetime('now')),
     finished_at   TEXT,
@@ -116,9 +116,9 @@ CREATE TABLE IF NOT EXISTS action_log (
     id            INTEGER PRIMARY KEY,
     run_id        INTEGER REFERENCES run_log(id),
     at            TEXT NOT NULL DEFAULT (datetime('now')),
-    action        TEXT NOT NULL,          -- update_document / append_document / ...
-    target_kind   TEXT NOT NULL,          -- document / db
-    target_id     TEXT,                   -- document path, row id
+    action        TEXT NOT NULL,          -- create_reminder / complete_reminder / ...
+    target_kind   TEXT NOT NULL,          -- reminder / event / note / file / db
+    target_id     TEXT,                   -- EventKit id, note id, path, row id
     reason        TEXT NOT NULL,          -- why Synth did this, in plain words
     evidence_id   INTEGER REFERENCES source(id),  -- the mail that justified it
     before_json   TEXT,                   -- prior state, for undo
@@ -127,6 +127,22 @@ CREATE TABLE IF NOT EXISTS action_log (
     undone_at     TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_action_at ON action_log (at DESC);
+
+-- ---------------------------------------------------------------- notes mirror
+
+-- The Notes folder is a two-way surface: Synth renders documents into it, and edits you
+-- make there are read back as corrections. last_written_hash is what Synth last wrote;
+-- if the live note differs, you changed it.
+CREATE TABLE IF NOT EXISTS notes_mirror (
+    id                 INTEGER PRIMARY KEY,
+    doc                TEXT NOT NULL UNIQUE,   -- logical document name
+    note_id            TEXT UNIQUE,            -- Notes.app x-coredata id
+    note_name          TEXT,
+    last_written_hash  TEXT,                   -- hash of normalised text Synth wrote
+    last_written_at    TEXT,
+    last_seen_hash     TEXT,                   -- hash observed on last poll
+    last_edit_at       TEXT                    -- when a user edit was last detected
+);
 
 -- ---------------------------------------------------------------- search
 
@@ -245,5 +261,35 @@ CREATE TABLE IF NOT EXISTS oauth_token (
 -- mail in full and conclude it was marketing mail; a sender that has never once produced an
 -- action does not deserve a model run. Sightings and actions are counted here so the
 -- demotion is evidence, not a guess, and `policy` records what was decided about it.
+CREATE TABLE IF NOT EXISTS sender_policy (
+    address        TEXT PRIMARY KEY,          -- lowercased bare address
+    display        TEXT,
+    policy         TEXT NOT NULL DEFAULT 'unknown'
+                     CHECK (policy IN ('unknown','ignore','digest','consider','urgent')),
+    decided_by     TEXT,                      -- which rule set it: 'static:no-reply', 'learned', 'manual'
+    sightings      INTEGER NOT NULL DEFAULT 0,
+    actions        INTEGER NOT NULL DEFAULT 0,
+    last_seen_at   TEXT,
+    first_seen_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at     TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 -- Mail that was filtered before any model saw it. Nothing is discarded: the next brief reads
 -- this table and names every message, so hard filtering never means invisible.
+CREATE TABLE IF NOT EXISTS mail_digest (
+    id             INTEGER PRIMARY KEY,
+    message_id     TEXT UNIQUE,
+    account        TEXT,
+    sender         TEXT,
+    subject        TEXT,
+    received_at    TEXT,
+    verdict        TEXT NOT NULL,             -- ignore / digest
+    decided_by     TEXT NOT NULL,             -- the rule that decided it
+    mail_index     INTEGER,                   -- position in the mailbox, to fetch links later
+    links          TEXT,                      -- destination URLs, extracted without a model
+    reported_at    TEXT,                      -- when a brief last named it
+    created_at     TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS mail_digest_unreported
+    ON mail_digest (reported_at) WHERE reported_at IS NULL;

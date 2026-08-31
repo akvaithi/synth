@@ -1,15 +1,19 @@
 """synth — command line entry point.
 
+    synth sync           one free sweep: documents, obligations, mail index, Notes mirror
     synth ingest         read Documents, extract text, cache it
     synth index          load extracted document text into the searchable index
     synth ocr            OCR the scanned PDFs that had no text layer
-    synth enrich         extract structured facts from the curated documents (uses a model)
+    synth enrich         extract structured facts from documents (the one model pass)
+    synth notes          re-render the Notes mirror
+    synth reconcile      align stored note hashes with what Notes actually holds
     synth call <name> [json]  direct tool dispatch (see: synth call)
     synth serve          run the connector HTTP server (behind Cloudflare)
     synth log            what Synth has done
     synth why <id>       why it did one thing
     synth undo <id>      reverse one action
     synth status         health of every moving part
+    synth budget [clear|reset <why>]  what it has spent, and what it may spend
 """
 from __future__ import annotations
 
@@ -17,24 +21,39 @@ import json
 import os
 import sys
 
-from synth import db
+from synth import config, db
 
 
+LOCK = os.path.expanduser("~/Developer/synth/.state/sweep.lock")
+SYNC_MARK = os.path.expanduser("~/Developer/synth/.state/sync.json")
 
 
-SWEEP_LOCK = os.path.expanduser("~/Developer/synth/.state/sweep.lock")
+def _load_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def _save_json(path, obj):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(obj, f, indent=2)
+    os.replace(tmp, path)
 
 
 def _exclusive():
-    """Hold a lock for a whole ingest/index sweep, or bail out.
+    """Hold a lock for the whole reaction, or bail out.
 
-    Inherited from the reactor, where a run regularly outlasted the 120s launchd interval and
-    two passes overlapped. The sweep has the same shape: a full pass over ~1,700 documents can
-    outlast its own timer, and two of them would fight over the SQLite write lock.
+    A run regularly outlasts the 120s launchd interval, so two passes overlapped and both
+    created the same reminder -- one run's own summary says "a reminder already existed from
+    a concurrent Synth process".
     """
     import fcntl
-    os.makedirs(os.path.dirname(SWEEP_LOCK), exist_ok=True)
-    fh = open(SWEEP_LOCK, "w")
+    os.makedirs(os.path.dirname(LOCK), exist_ok=True)
+    fh = open(LOCK, "w")
     try:
         fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
@@ -43,13 +62,23 @@ def _exclusive():
     return fh
 
 
+def cmd_budget(args):
+    from synth import budget
+    conn = db.connect()
+    if args and args[0] == "clear":
+        budget.clear_backoff()
+        print("backoff cleared")
+    if args and args[0] == "reset":
+        reason = " ".join(args[1:]) or "reset by hand"
+        e = budget.set_epoch(conn, reason)
+        print(f"ledger now counts from {e['since']} — {reason}")
+    print(budget.summary(conn))
+    return 0
+
+
 def cmd_ingest(args):
-    """Read Documents, extract text, cache it. Free: no model is involved at any point."""
+    """Read Documents, extract text, cache it. Free: no model is involved."""
     from synth import ingest
-    held = _exclusive()
-    if held is None:
-        print(json.dumps({"skipped": "another sweep is already running"}))
-        return 0
     conn = db.connect()
     limit = None
     for a in args:
@@ -59,12 +88,75 @@ def cmd_ingest(args):
     return 0
 
 
-def cmd_index(args):
-    from synth import indexer
+def cmd_sync(args):
+    """Keep every index current. The only thing that runs on its own.
+
+    Nothing here reasons or acts on Arun's behalf. It notices what changed, records it, and
+    stops -- documents re-indexed, obligations reconciled against Reminders, mail sorted into
+    the digest, the Notes mirror re-rendered. The one part that touches a model is the Haiku
+    pass over subject lines the static rules could not settle.
+    """
+    import time
+    from synth import indexer, ingest, mailsync, notes_sync, tools, triage as tri, watcher
+
     held = _exclusive()
     if held is None:
         print(json.dumps({"skipped": "another sweep is already running"}))
         return 0
+    conn = db.connect()
+    out = {}
+    # Watermark, taken before any work so a file written mid-sweep is caught next time
+    # rather than missed. The minute of slack covers clock skew and iCloud writing an mtime
+    # slightly behind the moment it finished.
+    mark = _load_json(SYNC_MARK, {})
+    since = mark.get("last_sweep")
+    started = time.time() - 60
+    full = "--full" in args
+
+    events = []
+    try:
+        events = watcher.collect(conn)
+    except Exception as e:
+        out["detect"] = f"{type(e).__name__}: {e}"
+
+    # Documents. Free. Only files touched since the last sweep, unless --full.
+    try:
+        out["ingest"] = ingest.scan(conn, since=None if full else since)
+        out["index"] = indexer.build(conn)
+        _save_json(SYNC_MARK, {"last_sweep": started})
+    except Exception as e:
+        out["documents"] = f"{type(e).__name__}: {e}"
+
+    # Calendar and reminders. Free -- EventKit through the daemon, then SQLite.
+    try:
+        out["obligations"] = tools.sync_obligations(conn)
+    except Exception as e:
+        out["obligations"] = f"{type(e).__name__}: {e}"
+
+    # Mail. Static rules free; Haiku only for what they could not settle.
+    mail = [e for e in events if e.get("kind") == "mail_new"]
+    try:
+        out["mail"] = mailsync.index_mail(conn, mail)
+        tri.learn(conn)
+    except Exception as e:
+        out["mail"] = f"{type(e).__name__}: {e}"
+
+    # Notes mirror. Free. The brief document is gone; these four are what remain.
+    notes = {}
+    for doc in ("obligations", "programs", "people", "activity"):
+        try:
+            notes[doc] = notes_sync.render(conn, doc)
+        except Exception as e:
+            notes[doc] = f"{type(e).__name__}: {e}"
+    out["notes"] = notes
+
+    watcher.clear_pending()
+    print(json.dumps(out, indent=2, default=str))
+    return 0
+
+
+def cmd_index(args):
+    from synth import indexer
     conn = db.connect()
     print(json.dumps(indexer.build(conn), indent=2))
     return 0
@@ -91,6 +183,14 @@ def cmd_enrich(args):
     results = enrich.run(conn, docs, dry_run=dry)
     print(json.dumps({"batches": len(results),
                       "errors": sum(1 for r in results if r.get("error"))}, indent=2))
+    return 0
+
+
+def cmd_notes(args):
+    from synth import notes_sync
+    conn = db.connect()
+    with db.run(conn, "notes_sync", trigger="manual") as run_id:
+        print(json.dumps(notes_sync.sync_all(conn, run_id=run_id), indent=2))
     return 0
 
 
@@ -134,6 +234,14 @@ def cmd_call(args):
     return 0
 
 
+def cmd_reconcile(args):
+    from synth import notes_sync
+    conn = db.connect()
+    print(json.dumps(notes_sync.reconcile(conn), indent=2))
+    print("pending after:", notes_sync.pending_corrections(conn))
+    return 0
+
+
 def cmd_log(args):
     from synth import tools
     conn = db.connect()
@@ -157,6 +265,7 @@ def cmd_undo(args):
 
 
 def cmd_status(args):
+    from synth.applekit import call, SynthdError
     conn = db.connect()
     print("database")
     for t in ("source", "document", "entity", "assertion", "obligation", "link",
@@ -166,15 +275,21 @@ def cmd_status(args):
         except Exception:
             n = "-"
         print(f"    {t:<12} {n}")
-    print("documents")
-    enriched = conn.execute("SELECT count(*) FROM enrichment").fetchone()[0]
-    docs = conn.execute("SELECT count(*) FROM document").fetchone()[0]
-    stale = conn.execute(
-        "SELECT count(*) FROM source s JOIN document d ON d.source_id = s.id "
-        "WHERE s.kind = 'file' AND s.content_hash IS NOT NULL").fetchone()[0]
-    print(f"    indexed      {docs}")
-    print(f"    enriched     {enriched} (the rest are searchable but not fact-extracted)")
-    print(f"    from files   {stale}")
+    print("daemon")
+    try:
+        print(f"    ping       {call('ping', timeout=15)}")
+        print(f"    tcc        {call('status', timeout=15)}")
+    except SynthdError as e:
+        print(f"    UNREACHABLE {e}")
+    print("budget")
+    from synth import budget
+    for line in budget.summary(conn).splitlines():
+        print(f"    {line}")
+    print("mail filter")
+    d = conn.execute("SELECT COUNT(*) FROM mail_digest WHERE reported_at IS NULL").fetchone()[0]
+    pol = dict(conn.execute("SELECT policy, COUNT(*) FROM sender_policy GROUP BY policy"))
+    print(f"    digest queue  {d} message(s) not yet surfaced to you")
+    print(f"    senders       {pol}")
     print("runs")
     for r in conn.execute("SELECT job, status, started_at, summary FROM run_log "
                           "ORDER BY id DESC LIMIT 5"):
@@ -184,9 +299,10 @@ def cmd_status(args):
 
 
 COMMANDS = {
-    "ingest": cmd_ingest, "index": cmd_index, "ocr": cmd_ocr, "enrich": cmd_enrich,
+    "sync": cmd_sync, "ingest": cmd_ingest, "index": cmd_index, "ocr": cmd_ocr,
+    "enrich": cmd_enrich, "notes": cmd_notes, "reconcile": cmd_reconcile,
     "call": cmd_call, "serve": cmd_serve, "log": cmd_log, "why": cmd_why,
-    "undo": cmd_undo, "status": cmd_status,
+    "undo": cmd_undo, "status": cmd_status, "budget": cmd_budget,
 }
 
 

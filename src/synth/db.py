@@ -105,7 +105,7 @@ def migrate(conn) -> list[str]:
     """
     done = []
     # A run killed mid-flight leaves its row saying 'running' forever, which makes `status`
-    # lie. Only enrichment writes run_log now, and it can still be interrupted.
+    # and the ledger both lie. Anything still marked running from a previous process is over.
     stale = conn.execute(
         "UPDATE run_log SET status = 'error', finished_at = ?, "
         "summary = COALESCE(summary, 'process ended before the run finished') "
@@ -114,6 +114,11 @@ def migrate(conn) -> list[str]:
     if stale:
         conn.commit()
         done.append(f"run_log: closed {stale} abandoned run(s)")
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(mail_digest)")}
+    for col, decl in (("mail_index", "INTEGER"), ("links", "TEXT")):
+        if col not in cols:
+            conn.execute(f"ALTER TABLE mail_digest ADD COLUMN {col} {decl}")
+            done.append(f"mail_digest: added {col}")
     # before/after record what the file looked like, which is enough to undo a write but not
     # enough to explain one. A document write logged as an append that behaved like a
     # replacement could not be diagnosed after the fact, because nothing recorded the
@@ -237,12 +242,31 @@ def log_action(conn, action: str, target_kind: str, reason: str, *,
 
 # ---------------------------------------------------------------- undo
 
-# A file write is undone by putting the previous bytes back and reindexing. A second table
-# stood beside this one mapping reminder, event and note actions to the synthd call that
-# reversed each; it went with the Apple integration, and documents are now the only thing
-# Synth writes. Each entry takes (conn, before) and returns a sentence for the caller.
+# Each entry maps an action to the synthd call that reverses it.
+REVERSALS = {
+    "complete_reminder": ("uncomplete_reminder", lambda before: {"id": before["id"]}),
+    "uncomplete_reminder": ("complete_reminder", lambda before: {"id": before["id"]}),
+    "update_reminder": ("update_reminder", lambda before: {
+        "id": before["id"], "title": before["title"], "notes": before["notes"],
+        **({"due": before["due"], "hasTime": before["hasTime"]} if before.get("due") else {}),
+    }),
+    "update_event": ("update_event", lambda before: {
+        "id": before["id"], "title": before["title"], "start": before["start"],
+        "end": before["end"], "location": before["location"], "notes": before["notes"],
+    }),
+    "notes_update": ("notes_update", lambda before: {
+        "id": before["id"], "body": before["body"],
+    }),
+}
+
+
+# Not everything is reversed by a synthd call. A file write is undone by putting the previous
+# bytes back and reindexing, which is Python, not AppleScript. Rather than widen REVERSALS
+# into a two-shaped table, these get their own: same dispatch, same before_json contract, a
+# different executor. Each takes (conn, before) and returns a sentence for the caller.
 def _restore_document(conn, before):
-    # Local import: docwrite imports db, so this cycle is real.
+    # Local import: docwrite imports db, so this cycle is real. Mirrors the local applekit
+    # import in undo() below.
     from synth import docwrite
 
     return docwrite.restore(conn, before)
@@ -256,6 +280,8 @@ PY_REVERSALS = {
 
 def undo(conn, action_id: int) -> str:
     """Reverse one logged action. Creations are not reversed — Synth never deletes."""
+    from synth.applekit import call
+
     row = conn.execute(
         "SELECT * FROM action_log WHERE id = ?", (action_id,)
     ).fetchone()
@@ -270,7 +296,16 @@ def undo(conn, action_id: int) -> str:
         conn.execute("UPDATE action_log SET undone_at = ? WHERE id = ?", (now(), action_id))
         conn.commit()
         return f"reversed action {action_id}: {detail}"
-    if row["action"].startswith("create_"):
-        return (f"action {action_id} created a {row['target_kind']}; Synth never deletes. "
-                f"Remove it by hand if you want it gone: {row['target_id']}")
-    return f"action {action_id} ({row['action']}) has no defined reversal"
+    if row["action"] not in REVERSALS:
+        if row["action"].startswith("create_"):
+            return (f"action {action_id} created a {row['target_kind']}; Synth never deletes. "
+                    f"Remove it by hand if you want it gone: {row['target_id']}")
+        return f"action {action_id} ({row['action']}) has no defined reversal"
+    if not row["before_json"]:
+        return f"action {action_id} has no recorded prior state, so it cannot be reversed"
+
+    cmd, build = REVERSALS[row["action"]]
+    call(cmd, **build(json.loads(row["before_json"])))
+    conn.execute("UPDATE action_log SET undone_at = ? WHERE id = ?", (now(), action_id))
+    conn.commit()
+    return f"reversed action {action_id}: {row['action']} on {row['target_kind']}"
