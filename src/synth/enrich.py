@@ -14,7 +14,7 @@ from synth import db, runner
 # Documents worth a model's attention, most authoritative first. Everything else is left to
 # full-text search, which is enough for "what did I write about X".
 PRIORITY_PATTERNS = [
-    ("consort", "Archive/Consort/markdown/%"),
+    ("curated", "Archive/Synth/markdown/%"),
     ("degree", "%DEGREE%"),
     ("course-plan", "%COURSE-PLAN%"),
     ("record", "%RECORD%"),
@@ -39,7 +39,9 @@ ENRICH_TOOLS = list(runner.DIRECT_TOOLS)
 
 
 def select(conn, extra_limit: int = 0) -> list[dict]:
-    """The curated set: Consort's distilled context first, then degree and record material."""
+    """The curated set: the distilled context documents first, then degree and record
+    material. The folder was called Archive/Consort until 2026-09-01, after the system that
+    exported it; the documents are the same ones."""
     done = {r[0] for r in conn.execute("SELECT document_id FROM enrichment")}
     seen, chosen = set(done), []
     for label, pattern in PRIORITY_PATTERNS:

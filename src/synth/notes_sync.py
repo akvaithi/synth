@@ -22,9 +22,16 @@ def _esc(s) -> str:
     return html.escape(str(s if s is not None else ""))
 
 
-def to_html(title: str, blocks: list) -> str:
-    """Notes treats the first line of the body as the title, so it leads and no <h1> follows."""
-    parts = [f"<div><b>{_esc(title)}</b></div>", "<div><br></div>"]
+# The last line of a rendered note, and the two are not interchangeable. The mirror's promise
+# is only true inside the Synth folder, which is the one place the watcher polls; printing it
+# on a recipe would promise a read-back that never happens.
+MIRROR_FOOTER = "Rendered by Synth. Edit freely — corrections are read back."
+NOTE_FOOTER = "Written by Synth."
+FOOTERS = (MIRROR_FOOTER, NOTE_FOOTER)
+
+
+def render_blocks(blocks: list) -> list[str]:
+    parts = []
     for block in blocks:
         kind = block[0]
         if kind == "h":
@@ -34,9 +41,77 @@ def to_html(title: str, blocks: list) -> str:
         elif kind == "ul":
             items = "".join(f"<li>{_esc(i)}</li>" for i in block[1])
             parts.append(f"<ul>{items}</ul>")
-    parts.append("<div><br></div>")
-    parts.append("<div><i>Rendered by Synth. Edit freely — corrections are read back.</i></div>")
+    return parts
+
+
+def to_html(title: str, blocks: list, footer: str = MIRROR_FOOTER) -> str:
+    """Notes treats the first line of the body as the title, so it leads and no <h1> follows."""
+    parts = [f"<div><b>{_esc(title)}</b></div>", "<div><br></div>"]
+    parts.extend(render_blocks(blocks))
+    if footer:
+        parts.append("<div><br></div>")
+        parts.append(f"<div><i>{_esc(footer)}</i></div>")
     return "\n".join(parts)
+
+
+# Matches a rendered footer at the very end of a body, tolerantly: Notes rewrites HTML on
+# save, so what comes back is the same text inside whatever tags and inline styles it decided
+# on. Anchored to the end, because a footer's words appearing mid-note are Arun's, not ours.
+_FOOTER_RE = re.compile(
+    r"(?:<div[^>]*>\s*(?:<br\s*/?>)?\s*</div>\s*)*"
+    r"<div[^>]*>(?:\s*<[^>]+>)*\s*(?:%s)\s*(?:</[^>]+>\s*)*</div>\s*$"
+    % "|".join(re.escape(html.escape(f)) for f in FOOTERS),
+    re.I)
+
+
+def append_html(body: str, blocks: list, footer: str = NOTE_FOOTER) -> str:
+    """Add rendered blocks to the end of a note's existing HTML, keeping what is already there.
+
+    Deliberately not a re-render. html_to_text is lossy — a heading and a bullet both come
+    back as a plain line — so rebuilding the note from its own text would silently flatten
+    formatting Arun applied by hand. The existing markup is passed through untouched and only
+    added to, which is the same reason update_document replaces an anchored passage instead of
+    accepting a whole file.
+
+    The old footer is lifted off the end first so appends do not stack one per edit. When it
+    cannot be found — Notes rewrote it past recognition, or the note never had one — nothing
+    is guessed at and no new footer is added.
+    """
+    trimmed, found = _FOOTER_RE.subn("", body or "")
+    parts = [trimmed.rstrip(), "<div><br></div>"]
+    parts.extend(render_blocks(blocks))
+    if footer and found:
+        parts.append("<div><br></div>")
+        parts.append(f"<div><i>{_esc(footer)}</i></div>")
+    return "\n".join(parts)
+
+
+def blocks_from_markdown(text: str) -> list:
+    """Turn plain markdown-ish text into the block tuples to_html renders.
+
+    Three shapes only, because three is what Notes renders well through AppleScript: a '#'
+    heading, a '- ' or '* ' bullet, and a paragraph. Consecutive bullets fold into one list,
+    so a recipe's ingredients come out as a single <ul> rather than a run of one-item lists.
+
+    Shared by the brief renderer and by create_note/append_note, so a note Synth writes is
+    laid out the same way a brief is.
+    """
+    blocks: list = []
+    for line in (text or "").split("\n"):
+        body = line.rstrip()
+        if not body:
+            continue
+        lead = body.lstrip()
+        if lead.startswith("#"):
+            blocks.append(("h", lead.lstrip("#").strip()))
+        elif lead.startswith(("- ", "* ")):
+            if blocks and blocks[-1][0] == "ul":
+                blocks[-1][1].append(lead[2:])
+            else:
+                blocks.append(("ul", [lead[2:]]))
+        else:
+            blocks.append(("p", body))
+    return blocks
 
 
 def html_to_text(body: str) -> str:
@@ -127,17 +202,7 @@ def doc_brief(conn) -> tuple[str, list]:
     if row is None:
         return "Synth — Brief", [("p", "No brief has run yet.")]
     blocks = [("p", f"{row['trigger']} brief — {db.local(row['started_at'])}"), ("p", "")]
-    for para in (row["summary"] or "").split("\n"):
-        text = para.rstrip()
-        if not text:
-            continue
-        stripped = text.lstrip("#").strip()
-        if text.startswith("#"):
-            blocks.append(("h", stripped))
-        elif text.lstrip().startswith(("- ", "* ")):
-            blocks.append(("ul", [text.lstrip()[2:]]))
-        else:
-            blocks.append(("p", text))
+    blocks.extend(blocks_from_markdown(row["summary"] or ""))
     return "Synth — Brief", blocks
 
 

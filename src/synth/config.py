@@ -20,19 +20,66 @@ BRIEF_EVENING = (20, 20)
 # The Notes folder that mirrors the context DB, and is read back for corrections.
 NOTES_FOLDER = "Synth"
 
+# Notes folders Synth may never write into, whatever it is asked. The mirror folder is owned
+# by notes_sync.render, which holds off re-rendering whenever a note carries an unread
+# correction; a note written into it by hand either gets rendered over or blocks the mirror.
+# Everything else is fair game -- Synth writes to any folder that exists and creates none,
+# the same rule Reminders lists follow.
+PROTECTED_NOTE_FOLDERS = [NOTES_FOLDER, "Recently Deleted"]
+
+# Where a note goes when the caller does not name a folder.
+DEFAULT_NOTE_FOLDER = "Notes"
+
 # Reads are confined to this subtree. The other iCloud Drive folders are media.
 DOCUMENTS_ROOT = "~/Library/Mobile Documents/com~apple~CloudDocs/Documents"
 
 # How many recent inbox messages to examine per account per sweep.
 MAIL_SCAN_LIMIT = 25
 
-# Reminder lists Synth may write to. Others are read-only to Synth.
-MANAGED_LISTS = ["Personal", "Academics", "Career", "Research"]
+# Reminder lists Synth may write to: any list that already exists.
+#
+# This was an allowlist of four -- Personal, Academics, Career, Research -- and nothing
+# domestic fitted in it. A grocery list, a chores list, anything household was refused before
+# EventKit was reached. The allowlist is gone rather than widened, because what it guarded
+# against (a mis-read email filing into the wrong list) is now guarded by "act only when
+# asked". The half that is structural remains: synthd's findReminderCalendar throws for a name
+# it cannot find and never creates a list, so Synth can write to every list Arun has and
+# cannot invent one.
 
-# Calendars Synth may create events in. Others are read-only to Synth, the same way
-# MANAGED_LISTS works for Reminders. Anything not named here is refused before EventKit
-# is touched, so a mis-read invitation cannot land on a shared or subscribed calendar.
+# Lists where an item is a line on a list, not an appointment. create_reminder's near-time
+# refusal assumes a commitment with a place in the day -- two things a few hours apart sharing
+# a distinctive word are usually one thing under two names. On a grocery list that assumption
+# is exactly wrong: 29 untimed items filed in one go are 29 different things, and the refusal
+# would fight every one of them. These lists get an exact-title check within the list instead.
+LIST_STYLE_LISTS = ["Grocery List", "Shopping"]
+
+# Most items one create_reminders call may file. A grocery run is twenty or thirty; past fifty
+# something has gone wrong with the caller rather than with the shopping.
+MAX_BATCH_REMINDERS = 50
+
+# Calendars Synth may create events in. Anything not named here is refused before EventKit is
+# touched, so a mis-read invitation cannot land on a shared or subscribed calendar. Unlike the
+# reminder lists this stays an allowlist: there is no way to delete an event, so a wrongly
+# created one has to be removed by Arun himself.
+#
+# Also read by agenda._collect. When the same event arrives twice -- once from the Google
+# calendar, once as its own Zoom event -- the copy that survives deduplication is the one on a
+# calendar named here, because that is the copy update_event could act on.
 MANAGED_CALENDARS = ["Personal", "Semester Calendar", "College Events", "Meetings"]
+
+# ---------------------------------------------------------------- the agenda
+#
+# An all-day event covering at least this many local days is reported once, in the agenda's
+# `spanning` field, rather than inside every day it touches. "New Member Applications Open!"
+# runs 26 August to 18 September and turned up in all seven responses of a week-long read; it
+# is never the answer to "what is on Tuesday". Two, so that a single-day all-day event -- a
+# holiday like Krishna Jayanti, which is a real constraint on that day -- still shows up in
+# its day, where it reads as one.
+SPANNING_ALL_DAY_DAYS = 2
+
+# Longest span one agenda or free_slots call may cover. The daemon reads the whole range in a
+# single EventKit predicate, so this bounds the response rather than the cost.
+MAX_AGENDA_DAYS = 31
 
 # Where an event goes when the caller does not name a calendar.
 DEFAULT_CALENDAR = "Personal"
@@ -40,11 +87,11 @@ DEFAULT_CALENDAR = "Personal"
 # ---------------------------------------------------------------- document writes
 #
 # The one folder Synth may write files in, relative to DOCUMENTS_ROOT. Everything else under
-# Documents is read-only, the same way MANAGED_LISTS works for Reminders.
-WRITABLE_DOCUMENTS = "Archive/Consort/markdown"
+# Documents is read-only, the same way MANAGED_CALENDARS works for Calendar.
+WRITABLE_DOCUMENTS = "Archive/Synth/markdown"
 
 # Files inside that folder that stay read-only. These are what enrich.py feeds to a model to
-# extract facts from -- PRIORITY_PATTERNS[0] is exactly 'Archive/Consort/markdown/%' -- and
+# extract facts from -- PRIORITY_PATTERNS[0] is exactly 'Archive/Synth/markdown/%' -- and
 # they are what Synth is told about itself. A system that can edit its own instructions and
 # then read them back as evidence is one that can talk itself into anything.
 PROTECTED_DOCUMENTS = ["self.md", "corrections.md", "patterns.md", "CLAUDE.md", "CONTEXT.md"]

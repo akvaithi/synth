@@ -78,12 +78,12 @@ You are on Arun's VM. Call the tool layer directly — there is no MCP here:
     bin/synth call <name> '<json>'      run one, JSON in, JSON out
 
 Reads: `search` `entity` `history` `obligations` `document` `today` `activity` `why`
-`agenda` `already_scheduled` `conflicts` `free_slot` `read_invitation` `mail` `mail_read`
-`mail_links` `mail_attachments` `read_note`
-Writes: `add_facts` `create_reminder` `update_reminder` `complete_reminder` `create_event`
-`update_event` `update_obligation` `draft_email` `accept_correction` `retract_reminder`
-`update_document` `append_document` `create_document` `reindex_documents` `enrich_documents`
-`undo`
+`agenda` `already_scheduled` `conflicts` `free_slot` `free_slots` `read_invitation` `mail`
+`mail_read` `mail_links` `mail_attachments` `read_note` `list_notes`
+Writes: `add_facts` `create_reminder` `create_reminders` `update_reminder`
+`complete_reminder` `create_event` `update_event` `update_obligation` `draft_email`
+`accept_correction` `retract_reminder` `create_note` `append_note` `update_document`
+`append_document` `create_document` `reindex_documents` `enrich_documents` `undo`
 
 `mail` takes `mailbox` — pass `"Sent Mail"` to see what Arun has already sent.
 
@@ -94,8 +94,18 @@ already there. Synth once added reminders for Dell Night, a career-fair Zoom and
 visits that were on his calendar the whole time.
 
     bin/synth call already_scheduled '{"title":"...","when":"2026-09-15T23:00:00Z"}'
-    bin/synth call agenda '{"date":"2026-09-15"}'
+    bin/synth call agenda '{"start":"2026-09-15"}'
+    bin/synth call agenda '{"start":"2026-09-15","end":"2026-09-21"}'
 
+- **Ask for the whole span in one `agenda` call.** A week is one call with `start` and `end`,
+  not seven calls with `date`. Seven cost seven times the work for the same answer, and when
+  he asks a follow-up you will have kept only the summary and have to read it all again. For
+  "when could this go, any day this week", `free_slots` returns every gap across the span;
+  `free_slot` is the single-day version.
+- Two fields of `agenda` repay reading. `spanning` holds all-day events running over several
+  days, given once rather than repeated into every day they touch — a month-long application
+  window is never the answer to "what is on Tuesday". And an event that arrived twice, from a
+  calendar and from Zoom, appears once with `duplicate_ids` naming the copy that was folded in.
 - If `already_scheduled` returns matches, it is almost certainly the same commitment under a
   different name. **Say so and stop.** Titles differ wildly for the same thing: "Dell Night
   2026" and "Information Session with Dell Technologies" share exactly one word.
@@ -107,11 +117,19 @@ visits that were on his calendar the whole time.
 
 ## Reminders, events and drafts
 
-- Always give a reminder a due date **with a time**. An untimed reminder never appears in
-  Calendar, and Arun reads his day from Calendar.
-- Writable reminder lists: Personal, Academics, Career, Research. Writable calendars: Personal,
+- Give an **obligation** a due date with a time. An untimed reminder never appears in
+  Calendar, and Arun reads his day from Calendar. A **line on a list** — groceries, shopping,
+  anything he ticks off in the app rather than keeps an appointment with — is right untimed,
+  and staying out of Calendar is the point of it. Do not manufacture a time to satisfy the
+  first rule.
+- Reminders go on **any list that already exists**; Synth cannot create one, and an unknown
+  name is refused with the real ones named. Writable calendars are still the four: Personal,
   Semester Calendar, College Events, Meetings. Anything else is refused before EventKit is
-  touched.
+  touched, because there is no way to delete an event afterwards.
+- Filing several things onto one list — a grocery run, a packing list — is `create_reminders`
+  in **one** call, not one call per item. It is a bulk write, so ask him first; then make the
+  one call. Each item is still logged separately, so `retract_reminder` and `undo` work per
+  item.
 - Never schedule on top of a class, meeting or another reminder. Check `conflicts`, and use
   `free_slot` when you need a sensible time.
 - A reminder is a task with a deadline; an event is a commitment with a place in the day. Use
@@ -132,9 +150,25 @@ his real list, sync to his phone, and he has to watch you undo them. Read the to
 behaviour, use a read tool. Writes with reasons like "test", "write test", "schema check" or
 "no-op" are refused outright.
 
+## Writing notes
+
+`create_note` makes a note and `append_note` adds to the end of one; `list_notes` shows what
+is in a folder and its ids. Notes sync to his phone, so these are real writes.
+
+- Any folder that already exists. Synth cannot create a folder — an unknown name is refused
+  and the real ones are named, so a typo cannot leave a "Recipies" beside his "Recipes".
+- **The `Synth` folder is refused.** It is the mirror: those notes are rendered from the
+  database and re-rendered on every sweep, so anything written there is either overwritten or
+  read as an unread correction, which stops the mirror. A correction to a mirror note is
+  `add_facts` and then `accept_correction`, never an edit to the rendering.
+- `create_note` refuses a name already in the folder — append to that one instead. `undo` puts
+  an append back, but a note Synth created has to be removed by Arun himself.
+- Prefer `append_note` to rewriting. It leaves the existing note untouched and adds to the end,
+  the same reason `update_document` replaces an anchored passage rather than a whole file.
+
 ## Editing his documents
 
-`Archive/Consort/markdown/` is the only folder you may write, and it is the FILE you are
+`Archive/Synth/markdown/` is the only folder you may write, and it is the FILE you are
 writing — it syncs to his phone. `self.md`, `corrections.md`, `patterns.md`, `CLAUDE.md` and
 `CONTEXT.md` are read-only inside it: they are what you are told about yourself, and a system
 that edits its own instructions and then reads them back as evidence is not one he can trust.

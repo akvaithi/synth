@@ -125,22 +125,46 @@ def add_facts(payload: dict, source_ref: str = "interview", document_id: int = 0
 def create_reminder(title: str, reason: str, due: str = "", list: str = "",
                     notes: str = "", entity: str = "", externally_set: bool = False,
                     force: bool = False) -> str:
-    """Create a reminder in a managed list (Personal, Academics, Career, Research).
+    """Create a reminder on any list that already exists. Synth cannot create a list; an
+    unknown name is refused with the real ones named.
 
-    Give `due` as ISO 8601 WITH a time — an untimed reminder never surfaces in Calendar, and
-    Arun reads his day from Calendar. Set externally_set true only for a real external
-    deadline, false for a target he chose.
+    For an obligation, give `due` as ISO 8601 WITH a time — an untimed reminder never surfaces
+    in Calendar, and Arun reads his day from Calendar. For a line on a list — groceries,
+    shopping — untimed is right, and not appearing in Calendar is the point. Set
+    externally_set true only for a real external deadline, false for a target he chose.
 
     `reason` is required, is recorded, and must say why this helps Arun in words he would
     understand months from now. Placeholders like "test" are refused. Never create a real
     reminder to probe this schema.
 
-    If something is already scheduled near that time the call is REFUSED and returns the
-    match — do nothing unless it is genuinely a different commitment, then pass force."""
+    Two different duplicate checks, and both REFUSE rather than create. Something with a due
+    time is matched against everything near that time, because one commitment goes by many
+    names. Anything untimed, date-only, or on a list-style list is matched on its exact title
+    within its own list instead. Either way, do nothing unless it is genuinely separate, then
+    pass force and say why in the reason.
+
+    Filing several things onto one list? Use create_reminders."""
     return _j(_with_conn(lambda c: tools.create_reminder(
         c, title=title, reason=reason, due=due or None, list=list or None,
         notes=notes or None, entity=entity or None, externally_set=externally_set,
         force=force)))
+
+
+def create_reminders(titles: list[str], reason: str, list: str = "", due: str = "",
+                     notes: str = "", entity: str = "", force: bool = False) -> str:
+    """File several reminders onto one list in a single call — a grocery run, a packing list,
+    a set of chores. Up to 50.
+
+    One `list`, one `reason` and one optional `due` cover the whole batch. Each item is still
+    created and logged individually, so retract_reminder and undo work per item.
+
+    An item already on that list by the same title is skipped rather than duplicated, and
+    comes back in `skipped` with the reason. Nothing is refused wholesale.
+
+    This is a bulk write: ask Arun before calling it, then make the one call."""
+    return _j(_with_conn(lambda c: tools.create_reminders(
+        c, titles=titles, reason=reason, list=list or None, due=due or None,
+        notes=notes or None, entity=entity or None, force=force)))
 
 
 def complete_reminder(ek_identifier: str, reason: str, evidence_source: str = "") -> str:
@@ -188,10 +212,21 @@ def update_event(ek_identifier: str, reason: str, title: str = "", start: str = 
         c, ek_identifier=ek_identifier, reason=reason, **fields)))
 
 
-def agenda(date: str) -> str:
-    """Everything already committed on one local day (YYYY-MM-DD): events and reminders.
+def agenda(start: str, end: str = "") -> str:
+    """Everything already committed between two local dates (YYYY-MM-DD): events and reminders.
+
+    Omit `end` for a single day. **Ask for the whole span in one call** — reading a week as
+    seven calls is seven times the work for the same answer, and you will not have the days
+    you did not ask for when a follow-up question arrives.
+
+    Two fields repay reading. `spanning` holds all-day events that run over several days,
+    returned once instead of in every day they touch — a month-long application window is
+    never the answer to "what is on Tuesday". And an event that came from two calendars at
+    once appears once, with `also_on` naming the other; its `id` is the copy update_event can
+    act on.
+
     Consult this before creating anything."""
-    return _j(_with_conn(lambda c: tools.agenda(c, date)))
+    return _j(_with_conn(lambda c: tools.agenda(c, start, end)))
 
 
 def already_scheduled(title: str, when: str, window_minutes: int = 240) -> str:
@@ -216,6 +251,16 @@ def free_slot(date: str, minutes: int = 30, earliest_hour: int = 8,
                                                         earliest_hour, latest_hour)))
 
 
+def free_slots(start: str, end: str = "", minutes: int = 45, earliest_hour: int = 8,
+               latest_hour: int = 21) -> str:
+    """Every opening of at least `minutes` between two local dates, day by day.
+
+    free_slot answers "when could this go today"; this answers "where are all the gaps this
+    week", which is the question behind anything recurring. Omit `end` for a single day."""
+    return _j(_with_conn(lambda c: tools.free_slots(c, start, end, minutes,
+                                                    earliest_hour, latest_hour)))
+
+
 def read_invitation(account: str, index: int, messageId: str, mailbox: str = "INBOX") -> str:
     """Open a message's .ics invitation and check the calendar for it in one call.
 
@@ -231,11 +276,48 @@ def retract_reminder(ek_identifier: str, reason: str) -> str:
     return _j(_with_conn(lambda c: tools.retract_reminder(c, ek_identifier, reason)))
 
 
-def read_note(doc: str = "", note_id: str = "") -> str:
-    """Read a mirrored note's current text. This is how corrections Arun types into the
-    Synth folder in Notes reach you. doc is one of: brief, obligations, programs, people,
-    activity."""
-    return _j(_with_conn(lambda c: tools.read_note(c, doc, note_id)))
+def read_note(doc: str = "", note_id: str = "", folder: str = "", name: str = "") -> str:
+    """Read a note's current text.
+
+    `doc` reads one of the mirrored documents — brief, obligations, programs, people,
+    activity — which is how corrections Arun types into the Synth folder reach you. `note_id`
+    reads one you already have an id for. `folder` with `name` reads any other note; find the
+    name with list_notes."""
+    return _j(_with_conn(lambda c: tools.read_note(c, doc, note_id, folder, name)))
+
+
+def list_notes(folder: str = "Notes") -> str:
+    """Names, sizes and opening lines of every note in a Notes folder. Bodies are not
+    included — read_note fetches the one that matters. An unknown folder comes back with the
+    real folder names, so this is also how to see what folders exist."""
+    return _j(_with_conn(lambda c: tools.list_notes(c, folder)))
+
+
+def create_note(name: str, body: str, reason: str, folder: str = "Notes") -> str:
+    """Create a note in Notes. It syncs to his phone.
+
+    Any folder that already exists — Synth cannot create one, and an unknown name is refused
+    with the real folders named. The "Synth" folder is the database mirror and is refused: its
+    notes are re-rendered, so anything written there is overwritten or blocks the mirror.
+
+    `body` takes '#' headings, '- ' bullets and blank-line-separated paragraphs, rendered the
+    way a brief is. Refused if a note of that name is already in the folder — append to that
+    one instead.
+
+    `reason` is required and recorded. Synth never deletes: a note it created has to be
+    removed by Arun himself, so be correspondingly deliberate."""
+    return _j(_with_conn(lambda c: tools.create_note(
+        c, name=name, body=body, reason=reason, folder=folder)))
+
+
+def append_note(note_id: str, text: str, reason: str) -> str:
+    """Add to the end of an existing note. Nothing already in it is touched, so this is the
+    safe way to add a recipe, an entry or a section. Get the id from list_notes.
+
+    Mirror notes are refused — a correction to one of those goes through add_facts, not
+    through editing the rendering. `reason` is required; undo puts the previous body back."""
+    return _j(_with_conn(lambda c: tools.append_note(
+        c, note_id=note_id, text=text, reason=reason)))
 
 
 def accept_correction(doc: str, reason: str) -> str:
@@ -291,7 +373,7 @@ def update_document(path: str, old: str, new: str, reason: str) -> str:
     """Replace one exact passage in one of Arun's markdown files. This writes the FILE, on
     disk, in iCloud — it syncs to his phone. It is a real edit, not a database note.
 
-    Only Archive/Consort/markdown/ is writable. Inside it, self.md, corrections.md,
+    Only Archive/Synth/markdown/ is writable. Inside it, self.md, corrections.md,
     patterns.md, CLAUDE.md and CONTEXT.md are read-only.
 
     `old` is the exact text to replace and MUST appear exactly once. Copy it verbatim from
@@ -320,7 +402,7 @@ def append_document(path: str, text: str, reason: str) -> str:
 
 
 def create_document(path: str, text: str, reason: str) -> str:
-    """Create a NEW file under Archive/Consort/markdown/. Refused if the path already exists
+    """Create a NEW file under Archive/Synth/markdown/. Refused if the path already exists
     — use update_document to change a passage, or append_document to add to the end.
 
     `path` is relative to Documents and must end in .md, .markdown or .txt. The file is
@@ -358,11 +440,13 @@ def undo(action_id: int) -> str:
 
 
 READ_TOOLS = [search_context, get_entity, fact_history, list_obligations, read_document,
-              today, activity, why, mail_recent, mail_read, mail_attachments, mail_links, read_note, agenda, already_scheduled,
-              conflicts, free_slot, read_invitation]
-WRITE_TOOLS = [add_facts, create_reminder, complete_reminder, update_reminder,
-               create_event, update_event,
+              today, activity, why, mail_recent, mail_read, mail_attachments, mail_links,
+              read_note, list_notes, agenda, already_scheduled,
+              conflicts, free_slot, free_slots, read_invitation]
+WRITE_TOOLS = [add_facts, create_reminder, create_reminders, complete_reminder,
+               update_reminder, create_event, update_event,
                update_obligation, draft_email, accept_correction, retract_reminder,
+               create_note, append_note,
                update_document, append_document, create_document,
                reindex_documents, enrich_documents, undo]
 

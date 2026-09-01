@@ -40,7 +40,7 @@ def resolve(rel_path: str) -> str:
     if not p:
         raise ValueError(
             "path is required: a path relative to Documents, the same form read_document "
-            "takes, e.g. 'Archive/Consort/markdown/RESUME-MASTER.md'")
+            "takes, e.g. 'Archive/Synth/markdown/RESUME-MASTER.md'")
     if p.startswith("~") or os.path.isabs(p):
         raise ValueError(
             f"{rel_path!r} is an absolute path. Give a path relative to Documents, the same "

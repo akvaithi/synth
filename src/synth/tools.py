@@ -150,6 +150,109 @@ def why(conn, action_id: int) -> dict:
     return {"found": True, **d}
 
 
+# ---------------------------------------------------------------- scheduling helpers
+
+
+def _reminder_lists() -> list[dict]:
+    """The reminder lists that exist right now, straight from EventKit."""
+    return call("lists", timeout=120)
+
+
+def _resolve_list(name: str | None) -> str | None:
+    """The real title of a reminder list, or a refusal that names the ones that exist.
+
+    There used to be an allowlist of four here and nothing domestic fitted in it — a grocery
+    list, a chores list, anything household was refused before EventKit was reached. Synth now
+    writes to any list Arun has and creates none, which is not a weaker rule so much as a
+    differently placed one: synthd's findReminderCalendar throws for a name it cannot find, so
+    "cannot create a list" is enforced by the daemon rather than by a name check here. What
+    this adds is saying so early, in words the caller can act on, instead of as a socket error.
+    """
+    if not name:
+        return None
+    live = _reminder_lists()
+    for c in live:
+        if c["title"].casefold() == name.casefold():
+            if not c.get("allowsModify", True):
+                raise ValueError(
+                    f"the reminder list {c['title']!r} is read-only — it is subscribed or "
+                    f"shared, and EventKit will not let anything write to it.")
+            return c["title"]
+    writable = sorted(c["title"] for c in live if c.get("allowsModify", True))
+    raise ValueError(
+        f"there is no reminder list named {name!r}. Synth writes to any list that exists and "
+        f"cannot create one — ask Arun to add it in Reminders first. Lists now: "
+        f"{', '.join(writable)}.")
+
+
+def _same_title(title: str, list_name: str | None, existing: list[dict]) -> dict | None:
+    """An open reminder with exactly this title, on this list."""
+    want = " ".join((title or "").split()).casefold()
+    for r in existing:
+        if list_name and r.get("list") != list_name:
+            continue
+        if " ".join((r.get("title") or "").split()).casefold() == want:
+            return r
+    return None
+
+
+def _refuse_duplicate(title: str, due: str | None, list_name: str | None,
+                      existing: list[dict] | None = None) -> dict | None:
+    """The duplicate check that fits the kind of thing being created, or None to go ahead.
+
+    An appointment — something with a due *time* — is checked against everything near that
+    time, because titles differ wildly for one commitment and proximity is the reliable
+    signal. That is what stopped the second Dell Night.
+
+    A line on a list is not an appointment, and near-time matching is exactly wrong for it: a
+    grocery batch filed against one evening would refuse itself item by item, each new entry
+    matching the last. So anything untimed, date-only, or on a list-style list gets an exact
+    title match within its own list instead — which is the duplicate that actually happens on
+    a list. Milk twice.
+    """
+    timed = bool(due) and "T" in due
+    if timed and list_name not in config.LIST_STYLE_LISTS:
+        from synth import agenda as _a
+        try:
+            check = _a.already_scheduled(title, due)
+        except Exception:
+            check = {"matches": []}
+        if check.get("matches"):
+            m = check["matches"][0]
+            return {"created": False, "refused": "already scheduled", "match": m,
+                    "advice": (f"{m['kind']} {m['title']!r} is already at {m['when']}, "
+                               f"{m['minutes_apart']} minutes from the proposed time. "
+                               f"Do nothing unless this is genuinely a different commitment, "
+                               f"in which case pass force=true and say why in the reason.")}
+        return None
+
+    dup = _same_title(title, list_name, existing if existing is not None
+                      else call("reminders", timeout=240))
+    if dup:
+        return {"created": False, "refused": "already on the list",
+                "match": {"kind": "reminder", "title": dup["title"], "list": dup["list"],
+                          "id": dup["id"], "due": dup.get("due") or None},
+                "advice": (f"{dup['title']!r} is already on {dup['list']}. Do nothing unless "
+                           f"this is genuinely a second one, in which case pass force=true "
+                           f"and say why in the reason.")}
+    return None
+
+
+def _file_obligation(conn, title: str, due, ek_id: str, entity_id=None,
+                     externally_set: bool = False) -> None:
+    """Record a reminder as an obligation — unless it is a line on a list.
+
+    An obligation is something owed, and it shows up as one: in list_obligations, in the
+    Notes mirror, in every brief until it is closed. A grocery item is not owed to anyone, and
+    twenty-nine of them would bury the four things that are.
+    """
+    conn.execute(
+        "INSERT INTO obligation (title, due, status, entity_id, ek_identifier, ek_kind, "
+        "externally_set) VALUES (?,?,'open',?,?,'reminder',?) "
+        "ON CONFLICT (ek_identifier) DO NOTHING",
+        (title, due, entity_id, ek_id, int(externally_set)))
+
+
 # ---------------------------------------------------------------- writes
 
 
@@ -199,34 +302,24 @@ def import_reminders(conn, run_id=None) -> dict:
 def create_reminder(conn, title: str, reason: str, due: str = None, list: str = None,
                     notes: str = None, entity: str = None, externally_set: bool = False,
                     force: bool = False, run_id=None, evidence_id=None) -> dict:
-    """Create a reminder, refusing to duplicate something already scheduled.
+    """Create a reminder, refusing to duplicate something already there.
 
     The check runs here rather than only in the prompt because prompts are advice and this
     is a rule. Two concurrent reactor batches created the same USAC reminder twice; a
-    structural check makes that impossible instead of merely discouraged.
+    structural check makes that impossible instead of merely discouraged. Which check applies
+    depends on whether this is an appointment or a line on a list — see _refuse_duplicate.
     """
     # Validate the reason before anything else. The duplicate check returns early, and with
     # the order reversed a placeholder reason slipped through unexamined whenever the
     # proposed time happened to clash.
     actions._require_reason(reason)
-    if list and list not in config.MANAGED_LISTS:
-        raise ValueError(f"{list!r} is not a managed list; expected one of {config.MANAGED_LISTS}")
-    if due and not force:
-        from synth import agenda as _a
-        try:
-            check = _a.already_scheduled(title, due)
-        except Exception:
-            check = {"matches": []}
-        if check.get("matches"):
-            m = check["matches"][0]
-            return {"created": False, "refused": "already scheduled",
-                    "match": m,
-                    "advice": (f"{m['kind']} {m['title']!r} is already at {m['when']}, "
-                               f"{m['minutes_apart']} minutes from the proposed time. "
-                               f"Do nothing unless this is genuinely a different commitment, "
-                               f"in which case pass force=true and say why in the reason.")}
+    lst = _resolve_list(list)
+    if not force:
+        refusal = _refuse_duplicate(title, due, lst)
+        if refusal:
+            return refusal
     action_id, result = actions.create_reminder(
-        conn, title=title, reason=reason, due=due, list=list, notes=notes,
+        conn, title=title, reason=reason, due=due, list=lst, notes=notes,
         run_id=run_id, evidence_id=evidence_id)
     created = result["created"]
     eid = None
@@ -234,14 +327,74 @@ def create_reminder(conn, title: str, reason: str, due: str = None, list: str = 
         row = conn.execute("SELECT id FROM entity WHERE name = ? COLLATE NOCASE",
                            (entity,)).fetchone()
         eid = row["id"] if row else None
-    conn.execute(
-        "INSERT INTO obligation (title, due, status, entity_id, ek_identifier, ek_kind, "
-        "externally_set) VALUES (?,?,'open',?,?,'reminder',?) "
-        "ON CONFLICT (ek_identifier) DO NOTHING",
-        (title, created.get("due"), eid, created["id"], int(externally_set)))
+    if lst not in config.LIST_STYLE_LISTS:
+        _file_obligation(conn, title, created.get("due"), created["id"], eid, externally_set)
     conn.commit()
     # Same shape as the refusal path, so a caller can always read `created` to know.
     return {"created": True, "action_id": action_id, "reminder": created}
+
+
+def create_reminders(conn, titles: list, reason: str, list: str = None, due: str = None,
+                     notes: str = None, entity: str = None, force: bool = False,
+                     run_id=None, evidence_id=None) -> dict:
+    """File a batch of reminders onto one list in a single call.
+
+    A grocery run is twenty-nine items, and twenty-nine create_reminder calls is twenty-nine
+    trips through a tool schema for one errand. The list is resolved once and the reason is
+    checked once, both applying to the whole batch — which is the honest shape, because one
+    reason is what Arun would want to read against all of them.
+
+    What is deliberately *not* batched is the audit trail: every item still gets its own
+    action_log row, so retract_reminder and undo work per item exactly as they do for a single
+    write. A batch that could only be undone wholesale would be a worse tool than the loop it
+    replaces.
+    """
+    actions._require_reason(reason)
+    names = [" ".join(t.split()) for t in (titles or []) if t and str(t).strip()]
+    if not names:
+        raise ValueError(
+            "titles is required: the reminders to file, as a list of strings.")
+    if len(names) > config.MAX_BATCH_REMINDERS:
+        raise ValueError(
+            f"{len(names)} titles is over the {config.MAX_BATCH_REMINDERS}-item limit for one "
+            f"batch. Nothing was created — split it, or look again at what produced this many.")
+    lst = _resolve_list(list)
+
+    eid = None
+    if entity:
+        row = conn.execute("SELECT id FROM entity WHERE name = ? COLLATE NOCASE",
+                           (entity,)).fetchone()
+        eid = row["id"] if row else None
+
+    # One reminders read for the whole batch. Checking each item on its own would be a
+    # 240-second EventKit fetch per grocery item, which is most of what the batch is here to
+    # avoid, and the answers would not differ.
+    existing = [] if force else call("reminders", timeout=240)
+
+    created, skipped, action_ids, seen = [], [], [], set()
+    for title in names:
+        key = title.casefold()
+        if key in seen:
+            skipped.append({"title": title, "why": "listed twice in this batch"})
+            continue
+        seen.add(key)
+        if not force:
+            dup = _same_title(title, lst, existing)
+            if dup:
+                skipped.append({"title": title, "why": f"already on {dup['list']}",
+                                "id": dup["id"]})
+                continue
+        action_id, result = actions.create_reminder(
+            conn, title=title, reason=reason, due=due, list=lst, notes=notes,
+            run_id=run_id, evidence_id=evidence_id)
+        made = result["created"]
+        if lst not in config.LIST_STYLE_LISTS:
+            _file_obligation(conn, title, made.get("due"), made["id"], eid)
+        created.append(made)
+        action_ids.append(action_id)
+    conn.commit()
+    return {"list": lst, "created": created, "skipped": skipped, "action_ids": action_ids,
+            "counts": {"created": len(created), "skipped": len(skipped)}}
 
 
 def complete_reminder(conn, ek_identifier: str, reason: str, evidence_source: str = None,
@@ -420,10 +573,20 @@ def sync_obligations(conn, run_id=None) -> dict:
     return {"completed_by_arun": completed, "deleted": vanished, "reopened": reopened}
 
 
-def agenda(conn, date: str) -> dict:
-    """Everything already committed on one local day: events and reminders together."""
+def agenda(conn, start: str = "", end: str = "", date: str = "") -> dict:
+    """Everything already committed across a span of local days.
+
+    One call per span, not one per day. Reading a week used to cost seven calls and fourteen
+    daemon round trips; it now costs one and two.
+
+    `date` is accepted as an alias for `start` so anything written against the one-day version
+    keeps working unchanged.
+    """
     from synth import agenda as _a
-    return _a.agenda(date)
+    first = start or date
+    if not first:
+        raise ValueError("start is required: a local date as YYYY-MM-DD.")
+    return _a.agenda_range(first, end or None)
 
 
 def already_scheduled(conn, title: str, when: str, window_minutes: int = 240) -> dict:
@@ -445,6 +608,20 @@ def find_free_slot(conn, date: str, minutes: int = 30, earliest_hour: int = 8,
     return _a.find_free_slot(date, minutes, earliest_hour, latest_hour)
 
 
+def free_slots(conn, start: str = "", end: str = "", minutes: int = 45,
+               earliest_hour: int = 8, latest_hour: int = 21) -> dict:
+    """Every opening of at least `minutes` across a span of days.
+
+    find_free_slot answers "when could this go today". Anything recurring asks a different
+    question — where are all the gaps this week — and building that by hand out of seven days
+    of agenda is the work this saves.
+    """
+    from synth import agenda as _a
+    if not start:
+        raise ValueError("start is required: a local date as YYYY-MM-DD.")
+    return _a.free_slots(start, end or None, minutes, earliest_hour, latest_hour)
+
+
 def mail_recent(conn, account: str, limit: int = 25, mailbox: str = "INBOX") -> list:
     """Inbox or any other mailbox. Use mailbox='Sent Mail' to check what has been replied to."""
     return call("mail_recent", account=account, limit=limit, mailbox=mailbox, timeout=300)
@@ -461,19 +638,166 @@ def mail_attachments(conn, account: str, index: int, messageId: str,
                 mailbox=mailbox, timeout=300)
 
 
-def read_note(conn, doc: str = "", note_id: str = "") -> dict:
-    """Read a note's current body — the channel for corrections Arun types into the mirror."""
+def _note_folders() -> list[str]:
+    return list(call("notes_folders", timeout=180))
+
+
+def _resolve_note_folder(name: str | None) -> str:
+    """The real name of a Notes folder to write into, or a refusal naming the ones that exist.
+
+    The same rule as reminder lists — write into anything that is there, create nothing — but
+    unlike Reminders it has to be enforced on this side. synthd's notesCreate calls
+    notesEnsureFolder, so without this check a typo would quietly make a folder rather than
+    fail, and Arun would find a "Recipies" sitting next to his "Recipes".
+    """
+    want = (name or config.DEFAULT_NOTE_FOLDER).strip()
+    live = _note_folders()
+    match = next((f for f in live if f.casefold() == want.casefold()), None)
+    if match is None:
+        raise ValueError(
+            f"there is no Notes folder named {want!r}. Synth writes into any folder that "
+            f"exists and cannot create one — make it in Notes first. Folders now: "
+            f"{', '.join(sorted(live))}.")
+    if any(match.casefold() == p.casefold() for p in config.PROTECTED_NOTE_FOLDERS):
+        raise PermissionError(
+            f"{match!r} is not Synth's to write into. {config.NOTES_FOLDER} is the mirror of "
+            f"the database: notes_sync owns those notes and re-renders them, so a note added "
+            f"by hand is either written over or read as an unread correction that stops the "
+            f"mirror. Put it in another folder.")
+    return match
+
+
+def list_notes(conn, folder: str = "") -> dict:
+    """What is in a Notes folder: names and openings, not bodies.
+
+    A dump with full bodies is large and almost never what was wanted — read_note fetches the
+    one that turns out to matter. Reading is unrestricted, the mirror folder included; it is
+    only writing that carves the mirror out.
+    """
+    want = (folder or config.DEFAULT_NOTE_FOLDER).strip()
+    live = _note_folders()
+    match = next((f for f in live if f.casefold() == want.casefold()), None)
+    if match is None:
+        return {"found": False, "folder": want, "folders": sorted(live)}
+    from synth.notes_sync import html_to_text
+    notes = []
+    for n in call("notes_dump", folder=match, timeout=300):
+        text = html_to_text(n.get("body", "")).strip()
+        notes.append({"id": n["id"], "name": n.get("name", ""), "chars": len(text),
+                      "preview": " ".join(text.split())[:120]})
+    notes.sort(key=lambda n: (n["name"] or "").casefold())
+    return {"found": True, "folder": match, "count": len(notes), "notes": notes}
+
+
+def read_note(conn, doc: str = "", note_id: str = "", folder: str = "",
+              name: str = "") -> dict:
+    """Read a note's current body.
+
+    Three ways in: `doc` for one of the mirror documents, which is the channel for corrections
+    Arun types into the Synth folder; `note_id` for one already identified; `folder` with
+    `name` for anything else.
+    """
     from synth.notes_sync import html_to_text
     if doc and not note_id:
         row = conn.execute("SELECT note_id FROM notes_mirror WHERE doc = ?", (doc,)).fetchone()
         if row is None or not row["note_id"]:
             return {"found": False, "doc": doc}
         note_id = row["note_id"]
+    if not note_id and name:
+        listed = list_notes(conn, folder)
+        if not listed.get("found"):
+            return listed
+        want = " ".join(name.split()).casefold()
+        hits = [n for n in listed["notes"]
+                if " ".join((n["name"] or "").split()).casefold() == want]
+        if not hits:
+            return {"found": False, "folder": listed["folder"], "name": name,
+                    "did_you_mean": [n["name"] for n in listed["notes"][:8]]}
+        if len(hits) > 1:
+            # Two notes really can share a name -- Recipes holds two called Black Bean Soup.
+            # Picking one silently would be a guess about which recipe he meant, so hand back
+            # both and let the caller choose by id.
+            return {"found": False, "folder": listed["folder"], "name": name,
+                    "ambiguous": hits,
+                    "error": f"{len(hits)} notes in {listed['folder']} are called {name!r}. "
+                             f"Read one by note_id."}
+        note_id = hits[0]["id"]
     if not note_id:
-        return {"found": False, "error": "doc or note_id is required"}
+        return {"found": False, "error": "doc, note_id, or folder and name is required"}
     n = call("notes_get", id=note_id, timeout=180)
     return {"found": True, "id": note_id, "name": n.get("name"),
             "text": html_to_text(n.get("body", ""))}
+
+
+def create_note(conn, name: str, body: str, reason: str, folder: str = "",
+                run_id=None) -> dict:
+    """Create a note in Notes. Refuses to overwrite one that is already there.
+
+    `body` is written the way a brief is — '#' headings, '- ' bullets, paragraphs — so what
+    lands in Notes reads as prose rather than as markdown source.
+    """
+    actions._require_reason(reason)
+    if not name or not name.strip():
+        raise ValueError("name is required: the note's title, which is also its first line.")
+    if not body or not body.strip():
+        raise ValueError("body is required: create_note will not make an empty note.")
+    dest = _resolve_note_folder(folder)
+    title = " ".join(name.split())
+
+    clash = next((n for n in call("notes_dump", folder=dest, timeout=300)
+                  if " ".join((n.get("name") or "").split()).casefold() == title.casefold()),
+                 None)
+    if clash is not None:
+        raise FileExistsError(
+            f"a note called {title!r} is already in {dest}. create_note never overwrites — "
+            f"append to it with append_note and id {clash['id']}, or pick another name.")
+
+    from synth import notes_sync
+    html = notes_sync.to_html(title, notes_sync.blocks_from_markdown(body),
+                              footer=notes_sync.NOTE_FOOTER)
+    created = call("notes_create", folder=dest, name=title, body=html, timeout=300)
+    action_id = db.log_action(conn, "notes_create", "note", reason, run_id=run_id,
+                              target_id=created.get("id"),
+                              after={"id": created.get("id"), "name": title, "folder": dest})
+    return {"created": True, "action_id": action_id, "id": created.get("id"),
+            "name": title, "folder": dest,
+            "note": "Synth never deletes; a note it created has to be removed by hand"}
+
+
+def append_note(conn, note_id: str, text: str, reason: str, run_id=None) -> dict:
+    """Add to the end of an existing note. Nothing already in it is touched.
+
+    The existing markup is passed through and only added to, never rebuilt — html_to_text is
+    lossy, so re-rendering a note from its own text would flatten headings and lists Arun may
+    have made by hand. Same reasoning as update_document's anchored replace.
+
+    Reversible: actions.notes_update records the previous body and db.REVERSALS puts it back.
+    """
+    actions._require_reason(reason)
+    if not note_id:
+        raise ValueError("note_id is required — find it with list_notes.")
+    if not text or not text.strip():
+        raise ValueError("text is required: there is nothing here to add.")
+
+    from synth import notes_sync
+    row = conn.execute("SELECT doc FROM notes_mirror WHERE note_id = ?", (note_id,)).fetchone()
+    # notes_mirror also holds a row for every note the watcher has merely *seen* in the Synth
+    # folder, so the presence of a row proves nothing. Only the rendered documents are barred.
+    if row is not None and row["doc"] in notes_sync.DOCS:
+        raise PermissionError(
+            f"{row['doc']!r} is a mirror note, rendered from the database. An append would be "
+            f"written over on the next sweep, and would read as an unread correction until it "
+            f"was — which stops the mirror re-rendering at all. Record the fact with add_facts "
+            f"instead.")
+
+    current = call("notes_get", id=note_id, timeout=180)
+    html = notes_sync.append_html(current.get("body", ""),
+                                  notes_sync.blocks_from_markdown(text))
+    action_id, _result = actions.notes_update(
+        conn, id=note_id, body=html, reason=reason, run_id=run_id)
+    return {"appended": True, "action_id": action_id, "id": note_id,
+            "name": current.get("name"),
+            "undo": f"undo({action_id}) puts the previous body back"}
 
 
 def accept_correction(conn, doc: str, reason: str, run_id=None) -> dict:
