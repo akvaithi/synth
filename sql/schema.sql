@@ -138,10 +138,16 @@ CREATE TABLE IF NOT EXISTS notes_mirror (
     doc                TEXT NOT NULL UNIQUE,   -- logical document name
     note_id            TEXT UNIQUE,            -- Notes.app x-coredata id
     note_name          TEXT,
-    last_written_hash  TEXT,                   -- hash of normalised text Synth wrote
+    last_written_hash  TEXT,                   -- hash of what Notes STORED after the write
     last_written_at    TEXT,
     last_seen_hash     TEXT,                   -- hash observed on last poll
-    last_edit_at       TEXT                    -- when a user edit was last detected
+    last_edit_at       TEXT,                   -- when a user edit was last detected
+    -- Hash of what Synth COMPOSED, before Notes touched it. Two hashes because Notes rewrites
+    -- HTML on save, so these are never equal and each answers a different question:
+    -- last_written_hash detects Arun's edits, last_render_hash detects whether re-rendering
+    -- would change anything. Comparing across the two made every note look permanently
+    -- changed and rewrote all of them every sweep, for ever.
+    last_render_hash   TEXT
 );
 
 -- ---------------------------------------------------------------- search

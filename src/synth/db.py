@@ -123,6 +123,16 @@ def migrate(conn) -> list[str]:
     # enough to explain one. A document write logged as an append that behaved like a
     # replacement could not be diagnosed after the fact, because nothing recorded the
     # arguments the tool was actually handed.
+    # Notes rewrites HTML on save, so the hash of what Synth sends never equals the hash of
+    # what Notes stores. render() compared those two to decide whether anything had changed,
+    # which could never be true: all five mirror notes were rewritten every sweep regardless
+    # of their content, 142 writes a day, and the action log held nothing else. The composed
+    # hash is now kept separately and compared against itself.
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(notes_mirror)")}
+    if "last_render_hash" not in cols:
+        conn.execute("ALTER TABLE notes_mirror ADD COLUMN last_render_hash TEXT")
+        done.append("notes_mirror: added last_render_hash")
+
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(action_log)")}
     if "args_json" not in cols:
         conn.execute("ALTER TABLE action_log ADD COLUMN args_json TEXT")
@@ -200,6 +210,14 @@ def run(conn, job: str, trigger: str | None = None):
             "UPDATE run_log SET finished_at=?, status='ok' WHERE id=?", (now(), run_id)
         )
         conn.commit()
+
+
+# The mirror re-rendering itself. Every write Synth makes is logged and that does not change
+# -- but these are housekeeping, not decisions, and they are logged three times a sweep. Left
+# in the default view they buried everything else: 142 of 142 actions in a day, so `activity`
+# showed eight hours of mirror churn and not one thing Synth had decided. Filtered out of the
+# views by default, still in the table for anyone who asks.
+HOUSEKEEPING = "(action = 'notes_update' AND reason LIKE 're-render % from the database')"
 
 
 ARG_VALUE_LIMIT = 4000

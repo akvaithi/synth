@@ -178,9 +178,13 @@ def doc_people(conn) -> tuple[str, list]:
 
 
 def doc_recent_actions(conn) -> tuple[str, list]:
+    # Excluding housekeeping is not only tidiness here, it is what stops the loop. This note
+    # renders the action log; rendering it logs a notes_update; that changed its own content
+    # and guaranteed another re-render on the next sweep, for ever. With its own churn out of
+    # the query the content settles and render() reports "unchanged".
     rows = conn.execute(
         "SELECT at, action, target_kind, reason, undone_at FROM action_log "
-        "ORDER BY id DESC LIMIT 40"
+        f"WHERE NOT {db.HOUSEKEEPING} ORDER BY id DESC LIMIT 40"
     ).fetchall()
     blocks = [("p", "What Synth has done, newest first. Nothing here is hidden from you.")]
     blocks.append(("ul", [
@@ -265,10 +269,17 @@ def render(conn, doc: str, run_id=None, force: bool = False) -> str:
 
     title, blocks = DOCS[doc](conn)
     body = to_html(title, blocks)
-    # Provisional. Notes rewrites HTML on save, so the hash of what we send never matches
-    # what it stores -- which made every note look permanently edited and would have broken
-    # the correction flow entirely. The authoritative hash is read back after writing.
-    new_hash = db.text_hash(html_to_text(body))
+    # Two hashes, and the distinction is the whole of this function's correctness. This one is
+    # of what Synth COMPOSED. The one read back after writing is of what Notes STORED, which
+    # differs because Notes rewrites HTML on save.
+    #
+    # They used to be compared against each other to decide whether anything had changed. They
+    # are never equal, so "unchanged" was unreachable and every mirror note was rewritten on
+    # every sweep whether or not a single fact had moved -- 142 writes a day, 100% of the
+    # action log, which buried the decisions the log exists to show. The activity note made it
+    # self-sustaining: it renders the action log, so its own re-render changed its content and
+    # guaranteed the next one.
+    render_hash = db.text_hash(html_to_text(body))
 
     row = conn.execute("SELECT * FROM notes_mirror WHERE doc = ?", (doc,)).fetchone()
 
@@ -276,7 +287,7 @@ def render(conn, doc: str, run_id=None, force: bool = False) -> str:
         if row["last_written_hash"] and row["last_seen_hash"] \
                 and row["last_seen_hash"] != row["last_written_hash"] and not force:
             return "held: unread correction in the note"
-        if row["last_written_hash"] == new_hash:
+        if row["last_render_hash"] == render_hash:
             return "unchanged"
         actions.notes_update(conn, id=row["note_id"], body=body, name=title,
                              reason=f"re-render {doc} from the database", run_id=run_id)
@@ -288,19 +299,22 @@ def render(conn, doc: str, run_id=None, force: bool = False) -> str:
         db.log_action(conn, "notes_create", "note", f"create {doc} mirror note",
                       run_id=run_id, target_id=note_id, after={"id": note_id, "doc": doc})
 
-    # Read back what Notes actually stored, through the same path the watcher uses.
+    # Read back what Notes actually stored, through the same path the watcher uses. This is
+    # what a later poll is compared against to detect an edit of Arun's.
+    stored_hash = render_hash
     try:
-        new_hash = live_hashes().get(note_id, new_hash)
+        stored_hash = live_hashes().get(note_id, render_hash)
     except Exception:
-        pass  # keep the provisional hash; reconcile will settle it
+        pass  # keep the composed hash; reconcile will settle it
 
     conn.execute(
         "INSERT INTO notes_mirror (doc, note_id, note_name, last_written_hash, "
-        "last_written_at, last_seen_hash) VALUES (?,?,?,?,?,?) "
+        "last_written_at, last_seen_hash, last_render_hash) VALUES (?,?,?,?,?,?,?) "
         "ON CONFLICT (doc) DO UPDATE SET note_id=excluded.note_id, "
         "note_name=excluded.note_name, last_written_hash=excluded.last_written_hash, "
-        "last_written_at=excluded.last_written_at, last_seen_hash=excluded.last_seen_hash",
-        (doc, note_id, title, new_hash, db.now(), new_hash),
+        "last_written_at=excluded.last_written_at, last_seen_hash=excluded.last_seen_hash, "
+        "last_render_hash=excluded.last_render_hash",
+        (doc, note_id, title, stored_hash, db.now(), stored_hash, render_hash),
     )
     conn.commit()
     return "written"

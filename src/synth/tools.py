@@ -132,10 +132,15 @@ def _unpack_state(d: dict) -> dict:
     return d
 
 
-def activity(conn, limit: int = 50) -> list[dict]:
+def activity(conn, limit: int = 50, include_housekeeping: bool = False) -> list[dict]:
+    """What Synth has done, newest first, with the mirror's own re-renders left out.
+
+    Pass include_housekeeping to see them; nothing is deleted from the log, only from the view.
+    """
+    where = "" if include_housekeeping else f"WHERE NOT {db.HOUSEKEEPING} "
     return db.localize([dict(r) for r in conn.execute(
         "SELECT id, at, action, target_kind, target_id, reason, undone_at "
-        "FROM action_log ORDER BY id DESC LIMIT ?", (limit,))], "at", "undone_at")
+        f"FROM action_log {where}ORDER BY id DESC LIMIT ?", (limit,))], "at", "undone_at")
 
 
 def why(conn, action_id: int) -> dict:
@@ -197,7 +202,7 @@ def _same_title(title: str, list_name: str | None, existing: list[dict]) -> dict
 
 
 def _refuse_duplicate(title: str, due: str | None, list_name: str | None,
-                      existing: list[dict] | None = None) -> dict | None:
+                      existing: list[dict] | None = None) -> tuple[dict | None, list]:
     """The duplicate check that fits the kind of thing being created, or None to go ahead.
 
     An appointment — something with a due *time* — is checked against everything near that
@@ -216,15 +221,19 @@ def _refuse_duplicate(title: str, due: str | None, list_name: str | None,
         try:
             check = _a.already_scheduled(title, due)
         except Exception:
-            check = {"matches": []}
+            check = {"matches": [], "time_conflicts": []}
+        overlaps = check.get("time_conflicts") or []
         if check.get("matches"):
             m = check["matches"][0]
             return {"created": False, "refused": "already scheduled", "match": m,
                     "advice": (f"{m['kind']} {m['title']!r} is already at {m['when']}, "
-                               f"{m['minutes_apart']} minutes from the proposed time. "
-                               f"Do nothing unless this is genuinely a different commitment, "
-                               f"in which case pass force=true and say why in the reason.")}
-        return None
+                               f"{m['minutes_apart']} minutes from the proposed time, and "
+                               f"they share {m['shared_words']}. Do nothing unless this is "
+                               f"genuinely a different commitment, in which case pass "
+                               f"force=true and say why in the reason.")}, overlaps
+        # Something close in time sharing no word is an overlap, not a duplicate. It used to
+        # refuse the write; now it rides along on the success so it can be reported.
+        return None, overlaps
 
     dup = _same_title(title, list_name, existing if existing is not None
                       else call("reminders", timeout=240))
@@ -234,8 +243,8 @@ def _refuse_duplicate(title: str, due: str | None, list_name: str | None,
                           "id": dup["id"], "due": dup.get("due") or None},
                 "advice": (f"{dup['title']!r} is already on {dup['list']}. Do nothing unless "
                            f"this is genuinely a second one, in which case pass force=true "
-                           f"and say why in the reason.")}
-    return None
+                           f"and say why in the reason.")}, []
+    return None, []
 
 
 def _file_obligation(conn, title: str, due, ek_id: str, entity_id=None,
@@ -314,8 +323,9 @@ def create_reminder(conn, title: str, reason: str, due: str = None, list: str = 
     # proposed time happened to clash.
     actions._require_reason(reason)
     lst = _resolve_list(list)
+    overlaps = []
     if not force:
-        refusal = _refuse_duplicate(title, due, lst)
+        refusal, overlaps = _refuse_duplicate(title, due, lst)
         if refusal:
             return refusal
     action_id, result = actions.create_reminder(
@@ -331,7 +341,13 @@ def create_reminder(conn, title: str, reason: str, due: str = None, list: str = 
         _file_obligation(conn, title, created.get("due"), created["id"], eid, externally_set)
     conn.commit()
     # Same shape as the refusal path, so a caller can always read `created` to know.
-    return {"created": True, "action_id": action_id, "reminder": created}
+    out = {"created": True, "action_id": action_id, "reminder": created}
+    if overlaps:
+        out["time_conflicts"] = overlaps
+        out["note"] = ("This shares the hour with something already scheduled but nothing in "
+                       "its name, so it was created. Tell Arun about the overlap rather than "
+                       "treating it as a duplicate.")
+    return out
 
 
 def create_reminders(conn, titles: list, reason: str, list: str = None, due: str = None,
@@ -533,12 +549,13 @@ def sync_obligations(conn, run_id=None) -> dict:
     himself stayed 'open' in the database and kept appearing in briefs as overdue. Nine
     obligations were nagging him about work he had already finished.
 
-    EventKit is the source of truth for state here; the database holds the reasoning.
+    EventKit is the source of truth for state here -- for the due date and title as much as
+    for completion -- and the database holds the reasoning.
     """
     live = {r["id"]: r for r in call("reminders", includeCompleted=True, timeout=300)}
-    completed, vanished, reopened = [], [], []
+    completed, vanished, reopened, redated = [], [], [], []
     for o in conn.execute(
-        "SELECT ek_identifier, title, status FROM obligation "
+        "SELECT ek_identifier, title, due, status FROM obligation "
         "WHERE ek_identifier IS NOT NULL AND ek_kind = 'reminder'"
     ).fetchall():
         r = live.get(o["ek_identifier"])
@@ -557,20 +574,39 @@ def sync_obligations(conn, run_id=None) -> dict:
             conn.execute("UPDATE obligation SET status='open', updated_at=? "
                          "WHERE ek_identifier=?", (db.now(), o["ek_identifier"]))
             reopened.append(o["title"])
+
+        # The date and the title, not only the status. This reconciled completion alone, so a
+        # reminder Arun rescheduled in the app kept Synth's date for ever: "Register to vote in
+        # College Station" sat in the database as 28 September while Reminders had said
+        # 2 September since the 25th of August. list_obligations sorts on this column, so a
+        # stale date does not misreport one row -- it puts every row in the wrong order and
+        # anything reasoning about urgency reads it backwards.
+        live_due = r.get("due") or None
+        live_title = (r.get("title") or "").strip() or o["title"]
+        if live_due != o["due"] or live_title != o["title"]:
+            conn.execute(
+                "UPDATE obligation SET due=?, title=?, updated_at=? WHERE ek_identifier=?",
+                (live_due, live_title, db.now(), o["ek_identifier"]))
+            if live_due != o["due"]:
+                redated.append(f"{live_title[:44]}: {db.local(o['due']) or 'no date'} -> "
+                               f"{db.local(live_due) or 'no date'}")
     conn.commit()
-    if completed or vanished or reopened:
+    if completed or vanished or reopened or redated:
         # Name them in the reason itself. "9 completed by Arun" told the brief a number but
         # not which, so it had to report that it could not say -- and Arun's standing rule is
         # that nothing Synth does goes unnamed.
         named = "; ".join(t[:48] for t in (completed + reopened)[:12])
         db.log_action(conn, "sync_obligations", "db",
                       f"reconciled against Reminders: {len(completed)} completed by Arun, "
-                      f"{len(vanished)} deleted, {len(reopened)} reopened"
-                      + (f" — {named}" if named else ""),
+                      f"{len(vanished)} deleted, {len(reopened)} reopened, "
+                      f"{len(redated)} re-dated"
+                      + (f" — {named}" if named else "")
+                      + (f" | dates: {'; '.join(redated[:6])}" if redated else ""),
                       run_id=run_id,
                       after={"completed": completed, "vanished": vanished,
-                             "reopened": reopened})
-    return {"completed_by_arun": completed, "deleted": vanished, "reopened": reopened}
+                             "reopened": reopened, "redated": redated})
+    return {"completed_by_arun": completed, "deleted": vanished, "reopened": reopened,
+            "redated": redated}
 
 
 def agenda(conn, start: str = "", end: str = "", date: str = "") -> dict:
@@ -602,14 +638,16 @@ def conflicts(conn, start: str, minutes: int = 30) -> dict:
 
 
 def find_free_slot(conn, date: str, minutes: int = 30, earliest_hour: int = 8,
-                   latest_hour: int = 21) -> dict:
+                   latest_hour: int = 21, buffer_minutes: int = None) -> dict:
     """First free slot on a day, avoiding events and other reminders."""
     from synth import agenda as _a
-    return _a.find_free_slot(date, minutes, earliest_hour, latest_hour)
+    buf = _a.DEFAULT_BUFFER if buffer_minutes is None else buffer_minutes
+    return _a.find_free_slot(date, minutes, earliest_hour, latest_hour, buf)
 
 
 def free_slots(conn, start: str = "", end: str = "", minutes: int = 45,
-               earliest_hour: int = 8, latest_hour: int = 21) -> dict:
+               earliest_hour: int = 8, latest_hour: int = 21,
+               buffer_minutes: int = None) -> dict:
     """Every opening of at least `minutes` across a span of days.
 
     find_free_slot answers "when could this go today". Anything recurring asks a different
@@ -619,7 +657,8 @@ def free_slots(conn, start: str = "", end: str = "", minutes: int = 45,
     from synth import agenda as _a
     if not start:
         raise ValueError("start is required: a local date as YYYY-MM-DD.")
-    return _a.free_slots(start, end or None, minutes, earliest_hour, latest_hour)
+    buf = _a.DEFAULT_BUFFER if buffer_minutes is None else buffer_minutes
+    return _a.free_slots(start, end or None, minutes, earliest_hour, latest_hour, buf)
 
 
 def mail_recent(conn, account: str, limit: int = 25, mailbox: str = "INBOX") -> list:

@@ -24,6 +24,11 @@ from synth.applekit import call
 STOP = {"the", "a", "an", "with", "and", "for", "of", "to", "at", "on", "in", "session",
         "meeting", "info", "information", "event", "night", "2026", "2027", "reminder"}
 
+# Minutes of air left either side of anything already scheduled when looking for a free slot.
+# Ten because the gap between two back-to-back classes across campus is not a free slot, and a
+# slot reported as starting the exact minute a class ends is arithmetically true and useless.
+DEFAULT_BUFFER = 10
+
 
 def _iso(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -263,9 +268,17 @@ def day(date: str) -> dict:
 def already_scheduled(title: str, when: str, window_minutes: int = 240) -> dict:
     """Is this commitment already on the calendar or in reminders?
 
-    Matches on proximity in time first, then on any meaningful shared word. A same-day item
-    within a few hours that shares a distinctive token is almost always the same thing under
-    a different name.
+    Two different answers, deliberately kept apart, because conflating them made a busy day
+    unwritable. A same-day item that shares a distinctive word is almost always the same thing
+    under another name -- "Dell Night 2026" and "Information Session with Dell Technologies"
+    share exactly one -- and that belongs in `matches`, which create_reminder refuses on.
+
+    Something merely close in time and sharing NOTHING is not a duplicate. It used to land in
+    the same list and carry the same verdict: asking about "Call Mom" at 5:20 PM returned
+    "Donuts and Discussion" ten minutes away with shared_words empty, and the write was
+    refused. On a Tuesday holding eight events almost any proposed time is within thirty
+    minutes of something, so the guard against duplicates became a guard against writing at
+    all. Those go in `time_conflicts` now: worth reporting, never worth blocking.
     """
     target = _parse(when)
     if target is None:
@@ -273,7 +286,7 @@ def already_scheduled(title: str, when: str, window_minutes: int = 240) -> dict:
     date = target.astimezone().strftime("%Y-%m-%d")
     sched = day(date)
     want = tokens(title)
-    hits = []
+    duplicates, overlaps = [], []
     for kind, items, key in (("event", sched["events"], "start"),
                              ("reminder", sched["reminders"], "due")):
         for it in items:
@@ -281,15 +294,30 @@ def already_scheduled(title: str, when: str, window_minutes: int = 240) -> dict:
             if t is None:
                 continue
             delta = abs((t - target).total_seconds()) / 60
+            if delta > window_minutes:
+                continue
             shared = want & tokens(it["title"])
-            if delta <= window_minutes and (shared or delta <= 30):
-                hits.append({"kind": kind, "title": it["title"], "when": it.get(key),
-                             "minutes_apart": round(delta), "shared_words": sorted(shared),
-                             "id": it["id"]})
-    hits.sort(key=lambda h: h["minutes_apart"])
-    db.localize(hits, "when")
-    return {"checked": True, "date": date, "matches": hits,
-            "verdict": "likely already scheduled" if hits else "nothing similar found"}
+            hit = {"kind": kind, "title": it["title"], "when": it.get(key),
+                   "minutes_apart": round(delta), "shared_words": sorted(shared),
+                   "id": it["id"]}
+            if shared:
+                duplicates.append(hit)
+            elif delta <= 30:
+                overlaps.append(hit)
+    for group in (duplicates, overlaps):
+        group.sort(key=lambda h: h["minutes_apart"])
+        db.localize(group, "when")
+    return {
+        "checked": True, "date": date,
+        "matches": duplicates,
+        "time_conflicts": overlaps,
+        "verdict": ("likely already scheduled" if duplicates
+                    else "time conflict only" if overlaps
+                    else "nothing similar found"),
+        "note": ("`matches` is the blocking answer: same commitment, different name. "
+                 "`time_conflicts` share the hour and nothing else — report them, never "
+                 "suppress a write over them."),
+    }
 
 
 def conflicts(start: str, minutes: int = 30) -> dict:
@@ -320,9 +348,15 @@ def conflicts(start: str, minutes: int = 30) -> dict:
 # ---------------------------------------------------------------- free time
 
 
-def _busy(sched: dict) -> list[tuple[datetime, datetime]]:
+def _busy(sched: dict, buffer_minutes: int = 0) -> list[tuple[datetime, datetime]]:
     """Merged busy intervals for one day: timed events, and a quarter hour either side of
     each timed reminder.
+
+    `buffer_minutes` widens each event so a "free" slot is not flush against one. Without it
+    a gap was reported starting at 2:40 PM, the exact minute CHEN 481 ends, and running to
+    4:10 PM, the exact minute CHEN 354 starts -- true of the calendar and useless to a person
+    who has to walk between them. Reminders keep their own quarter hour rather than stacking
+    the buffer on top; they are already padded for the same reason.
 
     The merge is what is new. Walking a cursor over unmerged intervals is enough to find the
     first opening, and wrong for enumerating every gap — two overlapping classes would leave
@@ -334,7 +368,8 @@ def _busy(sched: dict) -> list[tuple[datetime, datetime]]:
             continue
         a, b = _parse(ev.get("start", "")), _parse(ev.get("end", ""))
         if a and b and b > a:
-            spans.append((a, b))
+            pad = timedelta(minutes=buffer_minutes)
+            spans.append((a - pad, b + pad))
     for r in sched["reminders"]:
         d = _parse(r.get("due", ""))
         if d:
@@ -387,20 +422,29 @@ def _gaps(date: str, busy: list[tuple[datetime, datetime]], minutes: int,
 
 
 def find_free_slot(date: str, minutes: int = 30, earliest_hour: int = 8,
-                   latest_hour: int = 21) -> dict:
-    """First slot on a day with no event or reminder against it, in local waking hours."""
-    slots = _gaps(date, _busy(day(date)), minutes, earliest_hour, latest_hour)
+                   latest_hour: int = 21, buffer_minutes: int = DEFAULT_BUFFER) -> dict:
+    """First slot on a day with no event or reminder against it, in local waking hours.
+
+    `buffer_minutes` keeps the slot off the edges of what surrounds it; pass 0 for the old
+    flush-against-the-class behaviour.
+    """
+    slots = _gaps(date, _busy(day(date), buffer_minutes), minutes,
+                  earliest_hour, latest_hour)
     if slots:
         return {"date": date, "slot": slots[0]["start"],
                 "slot_local": slots[0]["start_local"],
-                "timezone": db.tzname(), "minutes": minutes}
-    return {"date": date, "slot": None,
+                "timezone": db.tzname(), "minutes": minutes,
+                "buffer_minutes": buffer_minutes}
+    return {"date": date, "slot": None, "buffer_minutes": buffer_minutes,
             "reason": f"no free {minutes}-minute window between "
-                      f"{earliest_hour}:00 and {latest_hour}:00"}
+                      f"{earliest_hour}:00 and {latest_hour}:00"
+                      + (f", allowing {buffer_minutes} minutes either side of anything "
+                         f"scheduled" if buffer_minutes else "")}
 
 
 def free_slots(start: str, end: str | None = None, minutes: int = 45,
-               earliest_hour: int = 8, latest_hour: int = 21) -> dict:
+               earliest_hour: int = 8, latest_hour: int = 21,
+               buffer_minutes: int = DEFAULT_BUFFER) -> dict:
     """Every opening of at least `minutes` across a span of days.
 
     find_free_slot answers "when could this go today". The question behind anything recurring
@@ -415,11 +459,12 @@ def free_slots(start: str, end: str | None = None, minutes: int = 45,
 
     days, total = [], 0
     for d in dates:
-        slots = _gaps(d, _busy({"events": events[d], "reminders": reminders[d]}),
+        slots = _gaps(d, _busy({"events": events[d], "reminders": reminders[d]},
+                               buffer_minutes),
                       minutes, earliest_hour, latest_hour)
         total += len(slots)
         days.append({"date": d, "weekday": datetime.fromisoformat(d).strftime("%a"),
                      "slots": slots})
     return {"start": dates[0], "end": dates[-1], "timezone": db.tzname(),
             "minutes": minutes, "earliest_hour": earliest_hour, "latest_hour": latest_hour,
-            "days": days, "total_slots": total}
+            "buffer_minutes": buffer_minutes, "days": days, "total_slots": total}

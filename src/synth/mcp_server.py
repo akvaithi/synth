@@ -53,7 +53,13 @@ def fact_history(name: str, predicate: str) -> str:
 
 
 def list_obligations(status: str = "open", limit: int = 100) -> str:
-    """Open obligations, earliest due first. status: open | waiting | done | all."""
+    """Open obligations, earliest due first. status: open | waiting | done | all.
+
+    Dates here are reconciled against Reminders on every sweep, so they follow anything Arun
+    reschedules in the app. If one ever disagrees with `today` or `agenda`, EventKit is the
+    source of truth — say so rather than working from this.
+
+    Keywords: todo, tasks, deadlines, what do I owe, due, outstanding."""
     return _j(_with_conn(lambda c: tools.list_obligations(c, status, limit)))
 
 
@@ -71,9 +77,15 @@ def today() -> str:
     return _j(_with_conn(lambda c: tools.today(c)))
 
 
-def activity(limit: int = 50) -> str:
-    """What Synth has done recently, newest first, with the reason for each action."""
-    return _j(_with_conn(lambda c: tools.activity(c, limit)))
+def activity(limit: int = 50, include_housekeeping: bool = False) -> str:
+    """What Synth has done recently, newest first, with the reason for each action.
+
+    The Notes mirror re-rendering itself is left out by default — it happens on every sweep and
+    would otherwise be the entire answer. Pass include_housekeeping to see it; nothing is ever
+    removed from the log itself.
+
+    Keywords: audit, history, log, what did you do, decisions, changes, undo, why."""
+    return _j(_with_conn(lambda c: tools.activity(c, limit, include_housekeeping)))
 
 
 def why(action_id: int) -> str:
@@ -142,6 +154,9 @@ def create_reminder(title: str, reason: str, due: str = "", list: str = "",
     names. Anything untimed, date-only, or on a list-style list is matched on its exact title
     within its own list instead. Either way, do nothing unless it is genuinely separate, then
     pass force and say why in the reason.
+
+    On success the result may carry `time_conflicts`: something sharing the hour but nothing
+    in its name. That is a note to pass on, not a reason the write should not have happened.
 
     Filing several things onto one list? Use create_reminders."""
     return _j(_with_conn(lambda c: tools.create_reminder(
@@ -232,10 +247,19 @@ def agenda(start: str, end: str = "") -> str:
 def already_scheduled(title: str, when: str, window_minutes: int = 240) -> str:
     """Whether a commitment is ALREADY on the calendar or in reminders.
 
-    Call this before every create_reminder or event. Matching is on time proximity first,
-    because titles differ wildly for the same thing — "Dell Night 2026" and "Information
-    Session with Dell Technologies" are one commitment sharing one word. If it returns
-    matches, do nothing."""
+    Call this before every create_reminder or event. Two answers, and they mean opposite
+    things:
+
+    `matches` — shares a distinctive word AND is close in time. One commitment under two
+    names: "Dell Night 2026" and "Information Session with Dell Technologies" share exactly
+    one word. If this is non-empty, do nothing.
+
+    `time_conflicts` — close in time and shares NOTHING. An overlap, not a duplicate. Report
+    it to Arun and create the thing anyway. Never suppress a write over these: on a day with
+    eight events almost any proposed time is within half an hour of something, and treating
+    that as a duplicate makes a busy day unwritable.
+
+    Keywords: duplicate, conflict, clash, overlap, is this already scheduled."""
     return _j(_with_conn(lambda c: tools.already_scheduled(c, title, when, window_minutes)))
 
 
@@ -245,20 +269,24 @@ def conflicts(start: str, minutes: int = 30) -> str:
 
 
 def free_slot(date: str, minutes: int = 30, earliest_hour: int = 8,
-              latest_hour: int = 21) -> str:
-    """First free slot on a day, avoiding events and other reminders."""
-    return _j(_with_conn(lambda c: tools.find_free_slot(c, date, minutes,
-                                                        earliest_hour, latest_hour)))
+              latest_hour: int = 21, buffer_minutes: int = 10) -> str:
+    """First free slot on a day, avoiding events and other reminders.
+
+    `buffer_minutes` keeps the slot off the edges of whatever surrounds it — without it a slot
+    is reported starting the exact minute a class ends, which is true and unusable. Pass 0 for
+    the flush behaviour."""
+    return _j(_with_conn(lambda c: tools.find_free_slot(c, date, minutes, earliest_hour,
+                                                        latest_hour, buffer_minutes)))
 
 
 def free_slots(start: str, end: str = "", minutes: int = 45, earliest_hour: int = 8,
-               latest_hour: int = 21) -> str:
+               latest_hour: int = 21, buffer_minutes: int = 10) -> str:
     """Every opening of at least `minutes` between two local dates, day by day.
 
     free_slot answers "when could this go today"; this answers "where are all the gaps this
     week", which is the question behind anything recurring. Omit `end` for a single day."""
-    return _j(_with_conn(lambda c: tools.free_slots(c, start, end, minutes,
-                                                    earliest_hour, latest_hour)))
+    return _j(_with_conn(lambda c: tools.free_slots(c, start, end, minutes, earliest_hour,
+                                                    latest_hour, buffer_minutes)))
 
 
 def read_invitation(account: str, index: int, messageId: str, mailbox: str = "INBOX") -> str:
