@@ -118,6 +118,27 @@ def why(action_id: int) -> str:
     return _j(_with_conn(lambda c: tools.why(c, action_id)))
 
 
+def mail_digest(limit: int = 40, links: bool = False, mark: bool = False) -> str:
+    """Mail that was filed by rule without a model ever reading it — newest first.
+    **Start here for "anything I missed?", "what came in?" or any question about the
+    inbox**: it answers from the index, instantly and for nothing, where mail_recent goes to
+    Mail itself and takes 15–48 seconds per account.
+
+    Each message carries the verdict (`digest` or `ignore`) and `decided_by`, the rule that
+    settled it, so you can say why something was filed rather than only that it was.
+
+    `links` is off by default and should stay off for "what arrived" — turning it on
+    re-resolves mailbox indexes against live Mail and took 99 seconds on the first call
+    against a backlog. Pass links=true when Arun wants the URL out of a specific message,
+    which is the case his standing rule is about: hand him the link, not the email.
+
+    Reading does not clear the queue. Pass mark=true only when Arun has actually been shown
+    these and wants them off the list — `waiting` tells you how many are outstanding.
+
+    Keywords: inbox, missed, filtered, newsletters, unread, what came in, anything urgent."""
+    return _j(_with_conn(lambda c: tools.mail_digest(c, limit=limit, links=links, mark=mark)))
+
+
 def mail_recent(account: str, limit: int = 25) -> str:
     """Recent inbox headers for one account (Work, College, Personal, iCloud).
     Headers only — use mail_read for a body. Each result carries the index needed to read it."""
@@ -515,8 +536,8 @@ def undo(action_id: int) -> str:
 
 
 READ_TOOLS = [search_context, get_entity, fact_history, list_obligations, read_document,
-              today, activity, why, mail_recent, mail_read, mail_attachments, mail_links,
-              read_note, list_notes, agenda, already_scheduled,
+              today, activity, why, mail_digest, mail_recent, mail_read, mail_attachments,
+              mail_links, read_note, list_notes, agenda, already_scheduled,
               conflicts, free_slot, free_slots, read_invitation]
 WRITE_TOOLS = [add_facts, create_reminder, create_reminders, complete_reminder,
                update_reminder, create_event, update_event,

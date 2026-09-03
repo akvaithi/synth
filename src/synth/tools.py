@@ -8,10 +8,11 @@ no send path for email, and nothing deletes anything of his.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 
-from synth import actions, config, db, docwrite, facts, ingest, predicates
+from synth import actions, config, db, docwrite, facts, ingest, predicates, triage
 from synth.applekit import call
 
 
@@ -69,7 +70,8 @@ def search_context(conn, query: str, limit: int = 20,
         out["note"] = (f"{hidden} fact value(s) withheld as sensitive — the predicate is "
                        f"shown. Re-ask with include_sensitive=true if Arun wants the value.")
     out["documents"] = [dict(r) for r in conn.execute(
-        "SELECT d.id, d.path, d.title, d.chars, snippet(document_fts, 1, '<<', '>>', ' … ', 24) AS excerpt "
+        "SELECT d.id, d.path, d.title, d.chars, "
+        "  snippet(document_fts, 1, '<<', '>>', ' … ', 24) AS excerpt "
         "FROM document_fts f JOIN document d ON d.id = f.rowid "
         "WHERE document_fts MATCH ? ORDER BY rank LIMIT ?", (q, limit))]
     out["links"] = [dict(r) for r in conn.execute(
@@ -272,6 +274,64 @@ def why(conn, action_id: int) -> dict:
                           (d["evidence_id"],)).fetchone()
         d["evidence"] = dict(ev) if ev else None
     return {"found": True, **d}
+
+
+def mail_digest(conn, limit: int = 40, links: bool = False, mark: bool = False) -> dict:
+    """Mail the static rules filed without a model reading it, newest first.
+
+    This is the read half of a contract that lost its other half. triage.py has been sorting
+    every message into `mail_digest` since the sender rules went in -- the whole point of
+    paying for the subject-line pass -- and the brief that used to read the table was removed
+    with the rest of the autonomy on 2026-08-26. Nothing has read it since; 163 messages were
+    waiting the day this was written.
+
+    Reading is not clearing. `mark` is the deliberate act that stamps reported_at, because a
+    question answered is not the same as a queue emptied, and a read that silently consumed
+    the backlog would make "what did I miss" answerable exactly once.
+
+    `links` is off by default, and that default is the whole point of the tool. Answering out
+    of the index is free and instant; filling links is not, because a mailbox index moves
+    every time mail arrives and has to be re-resolved against live Mail -- measured at 99
+    seconds over four accounts on the first call against a backlog. Turning it on for every
+    read would rebuild the 15-48s-per-account cost this tool exists to avoid. Ask for links
+    when Arun wants to act on something, not to tell him what arrived. What is filled stays
+    filled: the URLs are stored on the row, so a later read of the same message is free.
+    """
+    rows = triage.unreported(conn, limit=limit)
+    total = conn.execute(
+        "SELECT count(*) FROM mail_digest WHERE reported_at IS NULL").fetchone()[0]
+    if links:
+        try:
+            triage.fill_links(conn, rows)
+        except Exception as e:
+            # Link extraction reaches Mail through the daemon and a mailbox index moves
+            # whenever mail arrives. Losing the links is a worse answer, not a failed one.
+            rows = [dict(r, links_error=f"{type(e).__name__}: {e}") for r in rows]
+
+    for r in rows:
+        if isinstance(r.get("links"), str):
+            try:
+                r["links"] = json.loads(r["links"])
+            except ValueError:
+                r["links"] = []
+    db.localize(rows, "received_at")
+
+    by_verdict: dict[str, int] = {}
+    for r in rows:
+        by_verdict[r["verdict"]] = by_verdict.get(r["verdict"], 0) + 1
+
+    out = {
+        "waiting": total,
+        "shown": len(rows),
+        "by_verdict": by_verdict,
+        "messages": rows,
+        "marked_reported": triage.mark_reported(conn, [r["id"] for r in rows]) if mark else 0,
+    }
+    if total > len(rows):
+        out["note"] = (f"{total - len(rows)} more message(s) not shown — raise `limit`. "
+                       f"Nothing here has been read by a model; these are the sender and "
+                       f"subject rules' own verdicts.")
+    return out
 
 
 # ---------------------------------------------------------------- scheduling helpers

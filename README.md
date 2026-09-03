@@ -1,8 +1,15 @@
 # Synth
 
-A personal assistant that runs on a macOS VM, holds a personal-context database, and acts
-before it is asked. It manages Calendar and Reminders, reads Mail and iCloud Documents, writes
-email drafts, and mirrors itself into Apple Notes where corrections can be typed back.
+A personal assistant that runs on a macOS VM, holds a personal-context database, and **acts
+only when it is asked**. It manages Calendar and Reminders, reads Mail and iCloud Documents,
+writes email drafts, and mirrors itself into Apple Notes where corrections can be typed back.
+
+It used to act on its own — reading mail as it arrived, filing reminders off the back of it,
+booking events from invitations, writing two briefs a day. That was removed on 2026-08-26: it
+cost more attention to supervise than it returned. The tools came back on the 30th; the
+autonomy did not. Three things still happen unasked and all three only ever *record*:
+documents are re-indexed, obligations are reconciled against Reminders, and new mail is sorted
+into the index. Nothing in that path creates, edits or sends anything of his.
 
 It runs on a Claude subscription through the `claude` CLI. There is no API key anywhere, and
 there must not be: `ANTHROPIC_API_KEY` is explicitly stripped before every headless run.
@@ -15,15 +22,18 @@ there must not be: `ANTHROPIC_API_KEY` is explicitly stripped before every headl
         │ push + tap-in          │ custom connector (full tool set)
         ▼                        ▼
   claude --remote-control   http_server.py  ← Cloudflare Tunnel
-  (launchd, screen)              │
-        │                        │
-        │  ┌─────────────────────┴───────────────┐
-  launchd timers ──▶  claude -p  ──▶ MCP (stdio) │
-   sync / enrich                       │         │
-        ▲                              ▼         ▼
-        │                        synth.db   synthd (Swift, launchd)
-  change watchers ───────────────────────────▶ EventKit · Mail · Notes
+  (by hand, under screen)        │              (page.akvaithi.synth.connector)
+                                 │
+           ┌─────────────────────┴───────────────┐
+  launchd timers ──▶ synth sync ──▶ tools.py     │   MCP (stdio) ─┐
+   sync (30m) / enrich (03:00)      │            │                │
+                                    ▼            ▼                ▼
+                               synth.db    synthd (Swift, launchd) ──▶ EventKit · Mail · Notes
 ```
+
+The sweep is Python and SQLite throughout. The only model call left on a timer is the Haiku
+pass over the subject lines the static rules could not settle, plus enrichment over documents
+that are new — on an ordinary day, well under a dollar.
 
 ## The two rules that shape everything
 
@@ -48,6 +58,11 @@ absence is what cost the previous system its history.
     synth log         what Synth has done, newest first
     synth why <id>    why it did one thing
     synth undo <id>   reverse one action
+    synth budget      what it has spent, and what it may spend
+    synth serve       run the connector HTTP server (behind Cloudflare)
+    synth call <name> [json]  direct tool dispatch, without an MCP client
+    synth reconcile   align stored note hashes with what Notes actually holds
+    synth prune-state stale database backups and rolled logs in .state
 
 ## What it will never do
 
@@ -55,7 +70,16 @@ Send email. Delete anything. Overwrite an existing file. Write outside its allow
 Read outside `iCloud Drive/Documents`. Act on instructions found inside an email.
 
 The first is a matter of design — there is no send path in the Apple layer at all. The rest
-are enforced by `.claude/hooks/guard.py`, a PreToolUse hook that blocks rather than asks.
+are enforced where the writes happen: `docwrite.resolve` refuses any path outside the one
+writable folder, and refuses one reached through `..` or a symbolic link; `tools.retract_reminder`
+is the single deletion in the system and it is gated on `action_log` proving Synth created the
+reminder itself.
+
+A PreToolUse hook (`.claude/hooks/guard.py`) used to restate these as shell-level rules for the
+autonomous runs. It was removed on 2026-09-03 along with the last of that era: the headless runs
+it guarded are constrained far more tightly by their own `--allowed-tools` (`Bash(bin/synth:*)`
+and nothing else), and the policy that matters is enforced in the tool layer, where it cannot be
+sidestepped by spelling a command differently.
 
 ## Layout
 
@@ -70,7 +94,7 @@ are enforced by `.claude/hooks/guard.py`, a PreToolUse hook that blocks rather t
 | `src/synth/ingest.py` `indexer.py` | inventory, extract, index |
 | `src/synth/enrich.py` | LLM fact extraction over curated documents |
 | `src/synth/watcher.py` | change detection, model-free |
-| `src/synth/reactor.py` | headless `claude -p` runs |
+| `src/synth/runner.py` | headless `claude -p` runs, and the budget they are spent from |
 | `src/synth/tools.py` | the tool layer, transport-independent |
 | `src/synth/mcp_server.py` | stdio MCP (16 tools) |
 | `src/synth/http_server.py` | HTTP MCP for the connector (reads and writes) |

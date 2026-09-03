@@ -7,9 +7,8 @@ the previous system its history.
 """
 from __future__ import annotations
 
-import json
 
-from synth import db, predicates
+from synth import predicates
 
 ENTITY_KINDS = {"person", "org", "program", "course", "application", "project", "award", "topic"}
 
@@ -176,13 +175,13 @@ def ingest_batch(conn, payload: dict, source_id: int | None = None,
         add_edge(conn, src, dst, edge["relation"], source_id)
         counts["edges"] += 1
 
-    for l in payload.get("links", []):
+    for link in payload.get("links", []):
         eid = None
         for (k, n), v in ids.items():
-            if n == l.get("entity"):
+            if n == link.get("entity"):
                 eid = v
                 break
-        add_link(conn, l["url"], title=l.get("title"), kind=l.get("kind"),
+        add_link(conn, link["url"], title=link.get("title"), kind=link.get("kind"),
                  entity_id=eid, source_id=source_id)
         counts["links"] += 1
 

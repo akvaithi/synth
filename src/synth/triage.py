@@ -364,7 +364,7 @@ def fill_links(conn, rows: list[dict], cap: int = 12) -> None:
         if i:
             try:
                 found = maillinks.extract(r["account"], i, r["message_id"])
-                urls = [l["url"] for l in (found.get("links") or [])][:4]
+                urls = [link["url"] for link in (found.get("links") or [])][:4]
             except Exception:
                 urls = []
         payload = json.dumps(urls)

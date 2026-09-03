@@ -30,8 +30,11 @@ change detection and access live in the one process that is allowed to have them
         └── EKEventStoreChanged observer → .state/changes.jsonl
 ```
 
-Rebuilding the binary changes its ad-hoc cdhash and re-prompts for permission. A self-signed
-code-signing certificate would give a stable identity across rebuilds — still to do.
+Rebuilding the binary changes its ad-hoc cdhash and re-prompts for permission, which is fatal
+for an unattended daemon. A self-signed code-signing certificate gives a stable identity across
+rebuilds, and that is what is in use: `applekit/signing/synth-signing.crt`, created once by the
+recipe in `docs/setup.md` §3. The certificate does not need to be *trusted* — `codesign` will
+use an untrusted self-signed identity, and TCC only needs the identity to be stable.
 
 ## Layout
 
@@ -100,4 +103,53 @@ it. Recent mail is already cached, including attachments, and that is what Synth
 Older messages are fetched on demand, which also caches them.
 
 Known gap: Mail's AppleScript reports every attachment as `application/octet-stream`, so type
-must be inferred from the filename extension. Text extraction from PDF and .docx is not built.
+must be inferred from the filename extension. Text extraction itself is built — `extract.py`
+goes through MarkItDown for Office formats and PDFKit for PDFs, and `ocr.py` runs Vision OCR
+over the scanned PDFs that carry no text layer — but it runs over the iCloud Documents tree,
+not over mail attachments, which are saved to `.state/attachments` and left as bytes.
+
+
+## Where the write policy is actually enforced
+
+Worth stating plainly, because the boundary is not where it looks:
+
+**`synthd` exposes `delete_reminder` on the socket.** The doctrine that Synth never deletes
+anything of Arun's is enforced in Python, in `tools.retract_reminder`, which refuses unless
+`action_log` shows Synth created that exact reminder. The daemon itself will delete whatever
+it is asked to. That is sound — the socket is mode 0600 and reachable only by this user on
+this machine — but it means the daemon is not the last line of defence and must not be
+treated as one. Anything new that reaches the socket directly bypasses the rule.
+
+The same shape holds for documents: `docwrite.resolve` is the only containment check, and
+`applekit.call` will happily carry any command the daemon implements.
+
+**There is no PreToolUse hook any more.** `.claude/hooks/guard.py` restated the write policy
+as a matcher over shell command strings, for the autonomous `claude -p` runs. It was removed
+on 2026-09-03 with the last of that era. Two reasons, and the second is the real one:
+
+1. The runs it guarded are constrained far more tightly by their own allowlist —
+   `runner.DIRECT_TOOLS` is `Bash(bin/synth:*)` and nothing else for enrichment, and triage
+   gets `NO_TOOLS` with every built-in named in `DENY_ALL`. The hook's unique coverage
+   (refusing direct AppleScript, refusing iCloud reads outside Documents) was unreachable
+   from either.
+2. A rule enforced by pattern-matching a command string is a rule with a spelling. It blocked
+   a `grep` whose search pattern contained a removal verb, and refused to write a plan file
+   into `~/.claude/plans/`, while the policy that matters — what a *tool* may write, and
+   where — lives in the tool layer and has no spelling to get around.
+
+## Testing
+
+`uv run pytest` — 186 tests, no Apple, no model, no network. Everything builds against a
+temporary database created from `sql/schema.sql`, which is also what keeps that file honest:
+nothing else in the system would notice if it drifted from what `synth.db` actually holds.
+
+What is covered is deliberately not "the code" but the invariants that have already broken
+once, each of which is a comment in the source explaining what went wrong: the document-write
+path guard, predicate supersession, sensitive-value redaction, the UTC-to-local conversion,
+the budget ledger's timestamp shapes, the hand-maintained FTS index, `migrate` idempotency,
+the OAuth grant checks, and undo in both its daemon-backed and Python halves.
+
+`uv run ruff check src/ tests/` lints with `E`, `F` and `W` only — deliberately not ruff's
+default set, which flags 26 blind excepts that exist because Mail raises -10000 on a good
+message and one bad attachment must not lose it. A linter reporting a hundred things nobody
+intends to change is a linter that gets muted.

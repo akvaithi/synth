@@ -239,33 +239,43 @@ CREATE TABLE IF NOT EXISTS enrichment (
 
 -- ---------------------------------------------------------------- connector auth
 
+-- Nothing in these three tables is stored in a form that can be replayed. client_secret,
+-- code and token all hold a SHA-256 digest of the value the client was given: this file sits
+-- beside Arun's UIN, date of birth and home address, and a bearer token that can write to his
+-- calendar should not be legible to anything that can read it.
 CREATE TABLE IF NOT EXISTS oauth_client (
     client_id      TEXT PRIMARY KEY,
-    client_secret  TEXT,
+    client_secret  TEXT,                      -- sha256 of the secret handed out at registration
     name           TEXT,
     redirect_uris  TEXT NOT NULL,
     registered_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 CREATE TABLE IF NOT EXISTS oauth_code (
-    code           TEXT PRIMARY KEY,
+    code           TEXT PRIMARY KEY,          -- sha256 of the code in the redirect
     client_id      TEXT NOT NULL,
-    redirect_uri   TEXT NOT NULL,
-    challenge      TEXT,
-    challenge_method TEXT,
+    redirect_uri   TEXT NOT NULL,             -- the code is bound to it; /token re-checks
+    challenge      TEXT,                      -- PKCE; /authorize refuses to issue without one
+    challenge_method TEXT,                    -- S256 only
     subject        TEXT,
     expires_at     TEXT NOT NULL,
     used           INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS oauth_token (
-    token          TEXT PRIMARY KEY,
+    token          TEXT PRIMARY KEY,          -- sha256 of the access token
     client_id      TEXT NOT NULL,
     subject        TEXT,
     issued_at      TEXT NOT NULL DEFAULT (datetime('now')),
     expires_at     TEXT,
-    revoked_at     TEXT
+    revoked_at     TEXT,
+    -- Single-use: redeeming one revokes this row and issues a fresh pair. Rotation is what
+    -- makes theft visible -- the thief's first use breaks the real client.
+    refresh_token  TEXT,                      -- sha256 of the refresh token
+    refresh_expires_at TEXT
 );
+CREATE INDEX IF NOT EXISTS idx_oauth_refresh
+    ON oauth_token (refresh_token) WHERE refresh_token IS NOT NULL;
 
 
 -- ---------------------------------------------------------------- cost control

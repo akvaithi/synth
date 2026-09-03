@@ -21,3 +21,28 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/synth"]
+
+[dependency-groups]
+# Development only. Nothing here is imported by the running system, and the launchd jobs
+# use .venv directly, so `uv sync` without --group dev leaves the VM untouched.
+dev = ["pytest>=8.0", "ruff>=0.6"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# src/ is not installed into the venv -- bin/synth puts it on the path by hand, so the tests
+# have to do the same rather than relying on an editable install that does not exist.
+pythonpath = ["src"]
+
+[tool.ruff]
+# Matches the width the codebase is already written to; reflowing it would bury the comments
+# that carry most of the reasoning here.
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+# pyflakes and the pycodestyle errors -- the rules that find defects. Deliberately NOT the
+# default set, which is wider: it flags 26 blind excepts that exist because Mail raises -10000
+# on a good message and one bad attachment must not lose it, and 23 spellings of timezone.utc
+# that are correct as written. A linter that reports 117 things nobody intends to change is a
+# linter that gets muted, and then it stops reporting the unused import that matters.
+select = ["E", "F", "W"]
