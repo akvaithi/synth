@@ -133,12 +133,33 @@ def is_icloud_placeholder(path: str) -> bool:
     return base.startswith(".") and base.endswith(".icloud")
 
 
+def is_dataless(path: str) -> bool:
+    """Whether iCloud has evicted this file's contents from the disk.
+
+    Size is not the test, which is what made the old check useless. The file provider reports
+    an evicted file at its full logical size -- that is the whole point of the placeholder --
+    so `getsize(path) > 0` is true for a file whose bytes are entirely absent. What actually
+    distinguishes one is that it occupies no blocks.
+
+    Reading a dataless file normally triggers materialisation and blocks until it lands. Under
+    load the file provider returns EDEADLK instead ("Resource deadlock avoided"), which is
+    where a sweep's failures come from: 44 in one pass here, all of them transient.
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return False
+    return st.st_blocks == 0 and st.st_size > 0
+
+
 def materialise(path: str, timeout: int = 60) -> bool:
     """Ask iCloud to download an evicted file. Returns True if the bytes are present."""
-    if os.path.exists(path) and os.path.getsize(path) > 0:
+    if not os.path.exists(path):
+        return False
+    if os.path.getsize(path) > 0 and not is_dataless(path):
         return True
     subprocess.run(["/usr/bin/brctl", "download", path], capture_output=True, timeout=timeout)
-    return os.path.exists(path) and os.path.getsize(path) > 0
+    return os.path.exists(path) and os.path.getsize(path) > 0 and not is_dataless(path)
 
 
 def extract(path: str) -> str:

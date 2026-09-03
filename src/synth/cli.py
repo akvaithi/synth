@@ -72,6 +72,10 @@ def _exclusive():
 # "what happened just now".
 LOG_MAX_BYTES = 10 * 1024 * 1024
 
+# Scanned PDFs OCRed per sweep. Vision is free and offline, and slow enough that the whole
+# backlog would outlast the timer that starts it.
+OCR_PER_SWEEP = int(os.environ.get("SYNTH_OCR_PER_SWEEP", "6"))
+
 
 def rotate_logs(state_dir: str = None) -> list[str]:
     """Roll any oversized .log in .state to .log.1. Never raises: this is housekeeping."""
@@ -171,6 +175,27 @@ def cmd_sync(args):
                                "retry": res.get("failed_paths", [])})
     except Exception as e:
         out["documents"] = f"{type(e).__name__}: {e}"
+
+    # OCR, bounded. About a fifth of the PDFs under Documents are scans -- transcripts,
+    # letters, forms -- and they are often the ones carrying the hard facts. ocr_pass and
+    # `synth ocr` have existed all along, but nothing ever called them: there is no launchd
+    # job for OCR and the sweep did not do it, so 107 scanned documents sat permanently
+    # textless while ingest re-attempted them every thirty minutes and reported them as
+    # failures. That is what "the index is stale" actually was.
+    #
+    # A handful per sweep rather than the backlog at once: Vision is free and offline but
+    # costs seconds a page, and this runs inside a thirty-minute timer. At this rate the
+    # backlog drains in a day and a half, and afterwards there is rarely anything to do.
+    try:
+        if not full:
+            out["ocr"] = indexer.ocr_pass(conn, limit=OCR_PER_SWEEP)
+        else:
+            out["ocr"] = indexer.ocr_pass(conn)
+        # Newly OCRed text is only in the cache until the index is rebuilt over it.
+        if out["ocr"].get("ocred"):
+            out["index_after_ocr"] = indexer.build(conn)
+    except Exception as e:
+        out["ocr"] = f"{type(e).__name__}: {e}"
 
     # Calendar and reminders. Free -- EventKit through the daemon, then SQLite.
     try:
