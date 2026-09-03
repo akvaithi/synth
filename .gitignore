@@ -7,3 +7,9 @@ synth.db
 # WAL sidecars hold committed pages of the same database.
 synth.db-shm
 synth.db-wal
+
+# Private material kept outside the repo (see ~/Documents/synth-private).
+amd_links.json
+stm_links.json
+deploy/
+.DS_Store
