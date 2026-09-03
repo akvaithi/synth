@@ -8,7 +8,6 @@ Vision is native, free and offline, which matters: none of this leaves the machi
 """
 from __future__ import annotations
 
-import os
 
 MAX_PAGES = 40          # a scanned book is not worth ten minutes
 RENDER_SCALE = 2.0      # Vision needs resolution; page thumbnails at 1x read poorly

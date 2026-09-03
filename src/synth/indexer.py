@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 import time
 
-from synth import config, db, ingest
+from synth import config, ingest
 
 DOCUMENTS = os.path.expanduser(config.DOCUMENTS_ROOT)
 
