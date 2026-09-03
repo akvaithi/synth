@@ -853,24 +853,50 @@ func mailDraft(_ req: [String: Any]) throws -> [String: Any] {
     let recipients = (req["to"] as? [String]) ?? []
     guard !recipients.isEmpty else { throw SynthError(msg: "at least one recipient is required") }
     let account = req["account"] as? String
+    // `first email address of ...` does not compile: "email address" is not a class in Mail's
+    // dictionary, so AppleScript reads it as a class name it does not know and the whole
+    // script fails at COMPILE time with -2741 -- before any Apple Event is sent, which is why
+    // it looked like a permissions problem and failed identically five times. The property is
+    // `email addresses`, a list, so the account is bound first and item 1 taken from it.
+    //
+    // The list has to be bound to its own variable as well. `item 1 of (email addresses of
+    // acct)` builds a nested object specifier rather than indexing an evaluated list, and Mail
+    // then refuses it at runtime with -1700, "can't make ... into type specifier". Assigning
+    // to `addrs` forces the evaluation, and `as text` gives `sender` the string it wants.
     var senderLine = ""
     if let a = account {
-        senderLine = "set sender of msg to (first email address of (first account whose name is \(asQuote(a))))"
+        senderLine = """
+        \n        set acct to first account whose name is \(asQuote(a))
+                set addrs to email addresses of acct
+                set sender of msg to ((item 1 of addrs) as text)
+        """
     }
     var addLines = ""
     for r in recipients {
         addLines += "\n        make new to recipient at end of to recipients of msg with properties {address:\(asQuote(r))}"
     }
+    // Attachments are added after the body exists: `make new attachment` positions itself at
+    // a location in the content, and with no content there is nowhere to put it.
+    let attachments = (req["attachments"] as? [String]) ?? []
+    var attachLines = ""
+    for path in attachments {
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: path, isDirectory: &isDir), !isDir.boolValue else {
+            throw SynthError(msg: "attachment not found: \(path)")
+        }
+        attachLines += "\n        tell content of msg to make new attachment with properties {file name:(POSIX file \(asQuote(path)))} at after the last paragraph"
+    }
     let src = """
     tell application "Mail"
         set msg to make new outgoing message with properties {subject:\(asQuote(subject)), content:\(asQuote(body)), visible:false}
-        \(senderLine)\(addLines)
+        \(senderLine)\(addLines)\(attachLines)
         save msg
         return "saved"
     end tell
     """
     _ = try runAppleScript(src)
-    return ["drafted": true, "subject": subject, "to": recipients, "account": account ?? ""]
+    return ["drafted": true, "subject": subject, "to": recipients,
+            "account": account ?? "", "attachments": attachments]
 }
 
 // MARK: - dispatch

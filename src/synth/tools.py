@@ -1390,13 +1390,47 @@ def retract_reminder(conn, ek_identifier: str, reason: str, run_id=None) -> dict
 
 
 def draft_email(conn, to: list[str], subject: str, body: str, reason: str,
-                account: str = "Work", run_id=None) -> dict:
-    """Creates a draft. There is no send path and none may be added."""
+                account: str = "Work", attachments: list[str] = None, run_id=None) -> dict:
+    """Creates a draft, optionally with files attached. There is no send path and none may
+    be added.
+
+    `attachments` are paths relative to Documents, the same form read_document takes. They are
+    resolved against the Documents root and must resolve inside it -- a draft is the one write
+    that leaves the machine once he presses send, so what can be attached to it is exactly what
+    he can already read, and never an arbitrary path off the disk.
+    """
     if account not in config.MAIL_ACCOUNTS:
         raise ValueError(f"unknown account {account!r}")
-    result = call("mail_draft", to=to, subject=subject, body=body, account=account, timeout=300)
+
+    resolved = []
+    root = os.path.realpath(docwrite.DOCUMENTS)
+    for rel in (attachments or []):
+        if not rel or rel.startswith("~") or os.path.isabs(rel):
+            raise ValueError(
+                f"{rel!r}: give a path relative to Documents, the same form read_document "
+                f"takes, e.g. 'Career/Resume & Applications/Resume.pdf'")
+        full = os.path.realpath(os.path.join(root, rel))
+        if full != root and not full.startswith(root + os.sep):
+            raise PermissionError(
+                f"{rel!r} is outside Documents. Only files Arun can already read may be "
+                f"attached to a draft.")
+        if not os.path.isfile(full):
+            raise FileNotFoundError(f"{rel!r} is not a file under Documents.")
+        # A draft that syncs an evicted placeholder would send a 0-byte file.
+        from synth import extract as _extract
+        if not _extract.materialise(full):
+            raise FileNotFoundError(
+                f"{rel!r} is evicted from this machine and iCloud did not return it. "
+                f"Nothing was drafted.")
+        resolved.append(full)
+
+    result = call("mail_draft", to=to, subject=subject, body=body, account=account,
+                  attachments=resolved, timeout=300)
     action_id = db.log_action(conn, "mail_draft", "draft", reason, run_id=run_id,
-                              after={"to": to, "subject": subject, "account": account})
+                              after={"to": to, "subject": subject, "account": account,
+                                     "attachments": [os.path.basename(p) for p in resolved]},
+                              args={"to": to, "subject": subject, "body": body,
+                                    "attachments": attachments or []})
     return {"action_id": action_id, "draft": result}
 
 
