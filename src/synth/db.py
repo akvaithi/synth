@@ -193,6 +193,54 @@ def migrate(conn) -> list[str]:
                        for r in reported]})
         done.append(f"assertion: merged {moved} duplicate predicate spelling(s), "
                     f"{len(reported)} cluster(s) reported for review")
+    # OAuth secrets were stored in the clear: the access token, the code and the client
+    # secret were all replayable by anything that could read synth.db, which also holds the
+    # UIN, the date of birth and the home address. They are digests now.
+    #
+    # The existing values are hashed IN PLACE rather than revoked, so the live connector keeps
+    # working: the client still holds the plaintext, valid_token hashes what it presents, and
+    # the two match. Guarded by its own action_log row -- hashing a digest a second time would
+    # lock the connector out for good.
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(oauth_token)")}
+    for col in ("refresh_token", "refresh_expires_at"):
+        if col not in cols:
+            conn.execute(f"ALTER TABLE oauth_token ADD COLUMN {col} TEXT")
+            done.append(f"oauth_token: added {col}")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_oauth_refresh "
+                 "ON oauth_token (refresh_token) WHERE refresh_token IS NOT NULL")
+    conn.commit()
+
+    if not conn.execute(
+        "SELECT 1 FROM action_log WHERE action = 'hash_oauth_secrets' LIMIT 1"
+    ).fetchone():
+        import hashlib
+
+        def _digest(v):
+            return hashlib.sha256(v.encode()).hexdigest()
+
+        # A code is single-use and lives ten minutes; there is nothing worth carrying over,
+        # and rewriting them would only risk mangling one mid-flight.
+        dropped = conn.execute("DELETE FROM oauth_code").rowcount
+        tokens = conn.execute("SELECT token FROM oauth_token").fetchall()
+        for r in tokens:
+            conn.execute("UPDATE oauth_token SET token = ? WHERE token = ?",
+                         (_digest(r["token"]), r["token"]))
+        clients = conn.execute(
+            "SELECT client_id, client_secret FROM oauth_client "
+            "WHERE client_secret IS NOT NULL").fetchall()
+        for r in clients:
+            conn.execute("UPDATE oauth_client SET client_secret = ? WHERE client_id = ?",
+                         (_digest(r["client_secret"]), r["client_id"]))
+        conn.commit()
+        log_action(conn, "hash_oauth_secrets", "db",
+                   f"one-time: {len(tokens)} access token(s) and {len(clients)} client "
+                   f"secret(s) replaced by their SHA-256 digests, and {dropped} pending "
+                   f"authorization code(s) cleared. Existing tokens keep working -- the "
+                   f"client holds the plaintext and valid_token hashes what it presents.",
+                   after={"tokens": len(tokens), "clients": len(clients),
+                          "codes_cleared": dropped})
+        done.append(f"oauth: hashed {len(tokens)} token(s) and {len(clients)} client secret(s)")
+
     # run_log.status gained 'skipped'. SQLite cannot alter a CHECK constraint, so the table
     # is rebuilt -- the log is the troubleshooting record and must not be dropped.
     sql = conn.execute(
