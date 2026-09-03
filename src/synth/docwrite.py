@@ -197,9 +197,13 @@ def _upsert_document(conn, src_id: int, rel_path: str, text: str) -> int:
     values or the index keeps postings pointing at text that is no longer there, which
     surfaces later as 'database disk image is malformed' on an unrelated search.
 
-    That maintenance lives here rather than in a schema trigger because nothing in the repo
-    calls db.init() or db.migrate(): a trigger added to sql/schema.sql would sit in the file
-    and never reach synth.db, and this path would look correct while corrupting the index.
+    That maintenance lives here rather than in a schema trigger simply because the trigger
+    does not exist. An earlier note here justified it differently -- that nothing in the repo
+    calls db.init() or db.migrate(), so a trigger added to sql/schema.sql would never reach
+    synth.db -- and that is not true: `synth migrate` is cmd_migrate, and the schema file and
+    the live database were checked against each other and match in both directions. The line
+    below is right; the reason given for it was wrong, which is how a correct line gets
+    deleted by someone who checks the reason.
     """
     title = os.path.basename(rel_path)
     row = conn.execute("SELECT id, title, text FROM document WHERE source_id = ?",
