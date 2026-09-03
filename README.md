@@ -12,7 +12,7 @@ there must not be: `ANTHROPIC_API_KEY` is explicitly stripped before every headl
 ```
   iPhone / Mac — Claude app
         │                        │
-        │ push + tap-in          │ custom connector (read-only)
+        │ push + tap-in          │ custom connector (full tool set)
         ▼                        ▼
   claude --remote-control   http_server.py  ← Cloudflare Tunnel
   (launchd, screen)              │

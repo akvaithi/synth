@@ -25,7 +25,7 @@ from starlette.responses import JSONResponse, RedirectResponse, Response
 
 from synth import db
 
-# The public origin, e.g. https://personal.akvaithi.page
+# The public origin, e.g. https://connector.example.com
 ISSUER = os.environ.get("SYNTH_PUBLIC_URL", "http://127.0.0.1:8787").rstrip("/")
 CODE_TTL = timedelta(minutes=10)
 TOKEN_TTL = timedelta(days=30)

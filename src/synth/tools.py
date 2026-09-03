@@ -1,8 +1,10 @@
 """The tool surface, transport-independent.
 
-Both the local reactor (stdio MCP) and the remote connector (HTTP MCP) call these. Reads are
-safe to expose publicly; writes are wired only into the local transport, so a leaked endpoint
-can embarrass but cannot act.
+Both the local reactor (stdio MCP) and the remote connector (HTTP MCP) call these. The split
+that once kept writes off the public transport is gone -- http_server.py builds with
+writable=True at Arun's request, so the connector serves writes too and a leaked endpoint can
+act, not merely embarrass. What still holds is enforced in here rather than by the transport:
+no send path for email, and nothing deletes anything of his.
 """
 from __future__ import annotations
 

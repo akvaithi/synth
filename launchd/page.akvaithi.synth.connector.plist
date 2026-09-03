@@ -25,7 +25,7 @@
         <string>8787</string>
         <!-- Set once the hostname is decided; everything else derives from it. -->
         <key>SYNTH_PUBLIC_URL</key>
-        <string>https://personal.akvaithi.page</string>
+        <string>https://connector.example.com</string>
         <!-- 1 means refuse any request Cloudflare Access has not vouched for. -->
         <key>SYNTH_REQUIRE_ACCESS</key>
         <string>1</string>

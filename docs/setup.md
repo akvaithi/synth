@@ -55,6 +55,11 @@ identity, and TCC only needs the identity to be stable.
     cp launchd/*.plist ~/Library/LaunchAgents/
     launchctl bootstrap gui/$UID ~/Library/LaunchAgents/page.akvaithi.synth.daemon.plist
 
+If you want the connector, edit `SYNTH_PUBLIC_URL` in the copy of
+`page.akvaithi.synth.connector.plist` you just placed in `~/Library/LaunchAgents/`. It ships
+as `connector.example.com`; everything else about the connector's identity derives from it, so
+it must be the hostname you actually route to the tunnel.
+
 Then grant permissions. The first daemon start raises Calendar and Reminders prompts; the
 first Notes or Mail call raises Automation prompts. Approve them once — they persist across
 rebuilds now that the identity is stable.
