@@ -978,6 +978,73 @@ def mail_attachments(conn, account: str, index: int, messageId: str,
                 mailbox=mailbox, timeout=300)
 
 
+ATTACHMENTS = os.path.expanduser("~/Developer/synth/.state/attachments")
+
+
+def read_attachment(conn, account: str, index: int, messageId: str, name: str,
+                    mailbox: str = "INBOX", max_chars: int = 20000) -> dict:
+    """The text of one mail attachment.
+
+    The gap this closes: every engine needed for this already existed and none of it was
+    pointed at mail. extract.py reads PDFs through PDFKit and Office files through
+    MarkItDown, ocr.py runs Vision over scans, and the daemon has saved attachments to disk
+    since the beginning -- but the whole chain ran over the iCloud Documents tree only, so a
+    PDF that arrived by email was unreadable and the honest answer was "drag it into
+    Documents and I will index it". It is the same bytes and the same extractor.
+
+    Two things this deliberately does not do. It does not index the attachment: the document
+    index mirrors what is in Documents, and quietly filing mail attachments into it would
+    make search answer out of a folder Arun cannot see. And it does not fetch the message
+    body -- read the attachment for what the attachment says.
+
+    The Message-ID is verified before anything is saved. mail_attachments checks it inside
+    the daemon and refuses a mismatch; mail_save_attachment does not, and a mailbox index
+    moves every time mail arrives, so listing first is what stops the wrong message's file
+    being written to disk under the right name.
+    """
+    from synth import extract as _extract
+
+    listing = call("mail_attachments", account=account, index=index, messageId=messageId,
+                   mailbox=mailbox, timeout=300)
+    available = [a.get("name") for a in (listing.get("attachments") or [])]
+    if name not in available:
+        return {"found": False, "requested": name, "attachments": available,
+                "note": "no attachment by that name on this message; the names above are "
+                        "what it actually carries."}
+
+    saved = call("mail_save_attachment", account=account, index=index, name=name,
+                 mailbox=mailbox, directory=ATTACHMENTS, timeout=600)
+    path = saved["path"]
+    out = {"found": True, "name": name, "bytes": saved.get("bytes"), "path": path,
+           "account": account, "messageId": messageId}
+    try:
+        text = _extract.extract(path)
+    except _extract.ExtractionError as e:
+        # A scanned PDF reaches here with "no text layer", which is not a failure -- it is
+        # the case OCR exists for, and the same fallback the document path takes.
+        if "no text layer" in str(e) and path.lower().endswith(".pdf"):
+            from synth import ocr
+
+            text = ocr.ocr_pdf(path)
+            out["ocr"] = True
+            if not text.strip():
+                out["text"] = ""
+                out["note"] = ("OCR found no readable text. The file is saved and readable "
+                               "at the path above if it needs looking at by eye.")
+                return out
+        else:
+            out["found"] = True
+            out["text"] = ""
+            out["note"] = f"saved, but no text could be extracted: {e}"
+            return out
+
+    out["chars"] = len(text)
+    out["text"] = text[:max_chars]
+    if len(text) > max_chars:
+        out["truncated"] = f"{len(text) - max_chars} more characters; raise max_chars"
+    return out
+
+
 def _note_folders() -> list[str]:
     return list(call("notes_folders", timeout=180))
 
