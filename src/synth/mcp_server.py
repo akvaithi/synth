@@ -425,6 +425,28 @@ def accept_correction(doc: str, reason: str) -> str:
     return _j(_with_conn(lambda c: tools.accept_correction(c, doc, reason)))
 
 
+def read_attachment(account: str, index: int, messageId: str, name: str,
+                    mailbox: str = "INBOX", max_chars: int = 20000) -> str:
+    """The text inside one mail attachment — a PDF, a Word document, a spreadsheet, a scan.
+
+    **Use this instead of telling Arun to move a file into Documents.** Attachments go
+    through the same extractors as his documents: PDFKit for PDFs, MarkItDown for Office
+    formats, and Vision OCR automatically when a PDF turns out to be a scan with no text
+    layer. Nothing leaves the machine.
+
+    Get `name` from mail_attachments, which lists what a message carries. `index` and
+    `messageId` are the same pair every mail tool takes, and the id is verified before
+    anything is read.
+
+    The attachment is not added to the document index — that index mirrors Documents, and
+    search should not answer out of a folder he cannot see. Read it here and say what it says.
+
+    Keywords: attachment, PDF, the file he sent, proposal, announcement, resume, transcript."""
+    return _j(_with_conn(lambda c: tools.read_attachment(
+        c, account=account, index=index, messageId=messageId, name=name,
+        mailbox=mailbox, max_chars=max_chars)))
+
+
 def mail_links(account: str, index: int, messageId: str, mailbox: str = "INBOX") -> str:
     """Destination URLs and anchor text from one message.
 
@@ -537,7 +559,7 @@ def undo(action_id: int) -> str:
 
 READ_TOOLS = [search_context, get_entity, fact_history, list_obligations, read_document,
               today, activity, why, mail_digest, mail_recent, mail_read, mail_attachments,
-              mail_links, read_note, list_notes, agenda, already_scheduled,
+              read_attachment, mail_links, read_note, list_notes, agenda, already_scheduled,
               conflicts, free_slot, free_slots, read_invitation]
 WRITE_TOOLS = [add_facts, create_reminder, create_reminders, complete_reminder,
                update_reminder, create_event, update_event,

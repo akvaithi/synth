@@ -14,7 +14,7 @@ import os
 import time
 
 from synth import config, db
-from synth.extract import extract, ExtractionError, SKIP
+from synth.extract import extract, materialise, ExtractionError, SKIP
 
 # realpath, not just expanduser: docwrite.resolve() hands back a fully resolved path, and
 # relpath against a differently-spelled root yields a "../../.." native_id and a second
@@ -73,13 +73,41 @@ def cached_text_path(digest: str) -> str:
     return os.path.join(TEXT_CACHE, f"{digest}.txt")
 
 
+# Failures that a later sweep cannot turn into text. A scanned PDF needs OCR, not another
+# read; an unsupported type needs a new engine. Retrying them costs a full pass every thirty
+# minutes and, worse, reports them as fresh failures every time -- which is how a healthy
+# index came to be described as broken. They are counted and named, just not retried.
+PERMANENT_FAILURES = (
+    "no text layer",            # scanned: indexer.ocr_pass is the path for these
+    "unsupported type",
+    "binary or media type",
+    "PDFKit could not open",
+    "iWork document with no readable preview",
+    "all engines failed",
+)
+
+
+def is_transient(reason: str) -> bool:
+    """Whether trying this file again could plausibly succeed."""
+    return not any(p in reason for p in PERMANENT_FAILURES)
+
+
 def ingest_file(conn, path: str) -> tuple[str, int]:
     """Returns (status, chars). Status is cached / extracted / failed / skipped."""
     rel = os.path.relpath(path, DOCUMENTS)
     try:
         digest = file_hash(path)
     except OSError as e:
-        return f"failed:{e}", 0
+        # The first read of the file is also the first thing to touch an evicted one, and
+        # nothing had asked iCloud for it yet: materialise() lived only on the document-write
+        # path. Ask now and try once more, rather than recording a failure for a file that is
+        # simply not on the disk yet.
+        try:
+            if not materialise(path):
+                return f"failed:evicted from this machine; iCloud did not return it: {e}", 0
+            digest = file_hash(path)
+        except OSError as e2:
+            return f"failed:{e2}", 0
 
     src_id = db.upsert_source(conn, "file", rel, detail=os.path.basename(path),
                               content_hash=digest)
@@ -109,7 +137,8 @@ def scan(conn, limit: int | None = None, progress_every: int = 100,
         files = sorted(set(files) | set(extra))
     if limit:
         files = files[:limit]
-    stats = {"total": len(files), "extracted": 0, "cached": 0, "failed": 0, "chars": 0}
+    stats = {"total": len(files), "extracted": 0, "cached": 0, "failed": 0,
+             "permanent": 0, "chars": 0}
     failed_paths: list[str] = []
     failures: dict[str, int] = {}
     t0 = time.time()
@@ -122,9 +151,12 @@ def scan(conn, limit: int | None = None, progress_every: int = 100,
             stats["chars"] += chars
         else:
             stats["failed"] += 1
-            failed_paths.append(path)
             reason = status.split(":", 1)[1].strip()[:60] if ":" in status else status
             failures[reason] = failures.get(reason, 0) + 1
+            if is_transient(reason):
+                failed_paths.append(path)
+            else:
+                stats["permanent"] += 1
         if i % progress_every == 0:
             conn.commit()
             rate = i / max(time.time() - t0, 0.01)
@@ -136,6 +168,10 @@ def scan(conn, limit: int | None = None, progress_every: int = 100,
     # Named, not just counted. A sweep that filters on mtime would otherwise advance its
     # watermark past a file that failed and never look at it again -- an iCloud file evicted
     # at the wrong moment would be silently missing from the index forever.
+    #
+    # Only the transient ones. Every entry on this list before the split was a scanned PDF
+    # that ingest can never read, re-attempted on every sweep for ever; the ones that need
+    # OCR are already flagged in source.detail and indexer.ocr_pass is what collects them.
     stats["failed_paths"] = failed_paths[:200]
     stats["seconds"] = round(time.time() - t0, 1)
     return stats
