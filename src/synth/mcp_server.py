@@ -480,11 +480,20 @@ def update_obligation(ek_identifier: str, reason: str, externally_set: bool = No
 
 
 def draft_email(to: list[str], subject: str, body: str, reason: str,
-                account: str = "Work") -> str:
+                account: str = "Work", attachments: list[str] = None) -> str:
     """Write an email draft into Mail. It is saved, never sent — there is no send path and
-    none may be added. Arun reviews and sends it himself."""
+    none may be added. Arun reviews and sends it himself.
+
+    `attachments` takes paths relative to Documents, the same form read_document takes —
+    e.g. ["Career/Resume & Applications/Arun_Vaithianathan_Resume_Research.pdf"]. They must
+    resolve inside Documents: what can be attached is exactly what he can already read.
+
+    Write only what the evidence supports. A draft goes out over his name, so a credential,
+    a title or a claim that is not in the context database or in a document you have actually
+    read does not belong in it — say what you could not support rather than filling the gap."""
     return _j(_with_conn(lambda c: tools.draft_email(
-        c, to=to, subject=subject, body=body, reason=reason, account=account)))
+        c, to=to, subject=subject, body=body, reason=reason, account=account,
+        attachments=attachments)))
 
 
 def update_document(path: str, old: str, new: str, reason: str) -> str:
