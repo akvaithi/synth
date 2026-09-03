@@ -17,6 +17,7 @@
     synth budget [clear|reset <why>]  what it has spent, and what it may spend
     synth dedupe-predicates [--merge <keep_id> <id>...]  one fact under several names
     synth suspect-sources    live facts sourced from documents enrichment now excludes
+    synth prune-state [--yes] stale database backups and rolled logs in .state
 """
 from __future__ import annotations
 
@@ -24,7 +25,7 @@ import json
 import os
 import sys
 
-from synth import config, db
+from synth import db
 
 
 LOCK = os.path.expanduser("~/Developer/synth/.state/sweep.lock")
@@ -63,6 +64,41 @@ def _exclusive():
         fh.close()
         return None
     return fh
+
+
+# launchd appends to StandardOutPath for ever and rotates nothing. These four files only
+# grow: sync.out.log was 288 KB and index.out.log 324 KB after two weeks, which is small and
+# also monotonic. One generation is kept, because the reason to open one of these is always
+# "what happened just now".
+LOG_MAX_BYTES = 10 * 1024 * 1024
+
+
+def rotate_logs(state_dir: str = None) -> list[str]:
+    """Roll any oversized .log in .state to .log.1. Never raises: this is housekeeping."""
+    state_dir = state_dir or os.path.dirname(LOCK)
+    rotated = []
+    try:
+        names = os.listdir(state_dir)
+    except OSError:
+        return rotated
+    for name in names:
+        if not name.endswith(".log"):
+            continue
+        path = os.path.join(state_dir, name)
+        try:
+            if os.path.getsize(path) <= LOG_MAX_BYTES:
+                continue
+            os.replace(path, path + ".1")
+            # launchd holds the original descriptor open and keeps writing to the renamed
+            # inode until the job restarts. Truncating in place would be worse -- it would
+            # leave a sparse file the size of the old one -- so the new file appears here and
+            # the tail of the previous generation is what carries on filling for now.
+            with open(path, "w"):
+                pass
+            rotated.append(name)
+        except OSError:
+            continue
+    return rotated
 
 
 def cmd_budget(args):
@@ -162,15 +198,76 @@ def cmd_sync(args):
     out["notes"] = notes
 
     watcher.clear_pending()
+
+    # Free, and the only place that runs often enough to keep the state directory bounded.
+    rotated = rotate_logs()
+    if rotated:
+        out["rotated_logs"] = rotated
+    # Lets SQLite refresh the statistics its query planner uses, using whatever budget it
+    # thinks is warranted. Cheap when there is nothing to do, which is most sweeps.
+    try:
+        conn.execute("PRAGMA optimize")
+    except Exception as e:
+        out["optimize"] = f"{type(e).__name__}: {e}"
+
     print(json.dumps(out, indent=2, default=str))
     return 0
 
 
 def cmd_migrate(args):
-    """Bring the database up to the current schema. Safe to run twice."""
+    """Bring the database up to the current schema, and tidy it. Safe to run twice."""
     conn = db.connect()
     steps = db.migrate(conn)
     print("\n".join(f"  {s}" for s in steps) if steps else "  already current")
+
+    # This is already the "run it occasionally" command, and the database had never had
+    # either of these run against it: no ANALYZE since it was created, and a WAL that only
+    # ever checkpoints when SQLite decides to. Both are safe and both are quick at this size.
+    if "--no-tidy" not in args:
+        conn.execute("ANALYZE")
+        pages, _ = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[1:]
+        conn.commit()
+        print(f"  analysed; WAL checkpointed ({pages} page(s))")
+    return 0
+
+
+def cmd_prune_state(args):
+    """What in .state is safe to remove, and -- with --yes -- removing it.
+
+    Reports by default. Nothing here is Arun's: these are Synth's own database backups and
+    rolled log generations, and the never-delete rule is about his files. The confirmation
+    step is kept anyway, because a command that removes things on sight is one nobody reads
+    the output of.
+    """
+    state = os.path.dirname(LOCK)
+    keep_newest = 1
+    # By mtime, not by name. The backups carry the reason they were taken rather than only a
+    # timestamp -- pre-rename, pre-audit-fixes, pre-oauth-hash -- so sorting the names sorts
+    # by reason and keeps whichever one happens to sort last. Sorted that way this offered to
+    # remove a backup taken twenty minutes earlier and keep one from two days before.
+    backups = sorted((f for f in os.listdir(state) if f.startswith("synth.db.pre-")),
+                     key=lambda f: os.path.getmtime(os.path.join(state, f)), reverse=True)
+    stale = [f for f in os.listdir(state) if f.endswith(".log.1")]
+    stale += backups[keep_newest:]
+
+    if not stale:
+        print("nothing to prune")
+        return 0
+    total = 0
+    for name in stale:
+        size = os.path.getsize(os.path.join(state, name))
+        total += size
+        print(f"  {size / 1e6:8.1f} MB  {name}")
+    print(f"  {'-' * 8}")
+    kept = f"; keeping {backups[0]}" if backups else ""
+    print(f"  {total / 1e6:8.1f} MB in {len(stale)} file(s){kept}")
+
+    if "--yes" not in args:
+        print("\nnothing removed. Re-run with --yes to remove these.")
+        return 0
+    for name in stale:
+        os.remove(os.path.join(state, name))
+    print(f"\nremoved {len(stale)} file(s), {total / 1e6:.1f} MB")
     return 0
 
 
@@ -412,7 +509,7 @@ COMMANDS = {
     "call": cmd_call, "serve": cmd_serve, "log": cmd_log, "why": cmd_why,
     "undo": cmd_undo, "status": cmd_status, "budget": cmd_budget,
     "migrate": cmd_migrate, "dedupe-predicates": cmd_dedupe_predicates,
-    "suspect-sources": cmd_suspect_sources,
+    "suspect-sources": cmd_suspect_sources, "prune-state": cmd_prune_state,
 }
 
 

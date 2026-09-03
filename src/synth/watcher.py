@@ -16,7 +16,7 @@ import time
 from datetime import datetime, timezone
 
 from synth import config, db
-from synth.applekit import call, SynthdError
+from synth.applekit import call
 
 STATE = os.path.expanduser("~/Developer/synth/.state")
 QUEUE = os.path.join(STATE, "changes.jsonl")
@@ -42,6 +42,13 @@ def _save(path, obj):
 # ---------------------------------------------------------------- sources of change
 
 
+# Past this, the queue is truncated once it has been fully read. It is a transient hand-off
+# between synthd and this process, not a record of anything -- what mattered has already
+# become a document row, an obligation or a mail_digest entry by the time the drain returns.
+# Append-only, it had reached 831 KB and would have kept going for as long as the daemon runs.
+QUEUE_MAX_BYTES = 5 * 1024 * 1024
+
+
 def drain_fsevents(state: dict) -> list[dict]:
     """Consume anything synthd's FSEvents watchers appended since our last read."""
     if not os.path.exists(QUEUE):
@@ -62,6 +69,22 @@ def drain_fsevents(state: dict) -> list[dict]:
             except ValueError:
                 continue
         state["queue_offset"] = f.tell()
+
+    # Truncate only when nothing was appended between finishing the read and this moment.
+    # The daemon writes to this file continuously, so the window between f.tell() and the
+    # open-for-write is real, and anything landing in it would be discarded unread. Checking
+    # the size again costs a stat and closes it: if the file has grown, leave it and truncate
+    # on the next sweep instead, when the tail has been read too.
+    if size > QUEUE_MAX_BYTES and state["queue_offset"] >= size:
+        try:
+            if os.path.getsize(QUEUE) == state["queue_offset"]:
+                with open(QUEUE, "w"):
+                    pass
+                # drain_fsevents already restarts from 0 when `size < offset`; this is the
+                # same condition, created deliberately rather than found.
+                state["queue_offset"] = 0
+        except OSError:
+            pass    # a queue that cannot be truncated is not a reason to lose the events
     return out
 
 
