@@ -13,10 +13,6 @@ MAIL_ACCOUNTS = {
 # chew on costs quota, so this can be short.
 DEBOUNCE_SECONDS = 120
 
-# Briefs, local time.
-BRIEF_MORNING = (6, 50)
-BRIEF_EVENING = (20, 20)
-
 # The Notes folder that mirrors the context DB, and is read back for corrections.
 NOTES_FOLDER = "Synth"
 
@@ -94,7 +90,12 @@ WRITABLE_DOCUMENTS = "Archive/Synth/markdown"
 # extract facts from -- PRIORITY_PATTERNS[0] is exactly 'Archive/Synth/markdown/%' -- and
 # they are what Synth is told about itself. A system that can edit its own instructions and
 # then read them back as evidence is one that can talk itself into anything.
-PROTECTED_DOCUMENTS = ["self.md", "corrections.md", "patterns.md", "CLAUDE.md", "CONTEXT.md"]
+# self.md, patterns.md and corrections.md were removed on 2026-09-01. All three were empty
+# scaffolds announcing beliefs they did not hold: the first two were read-only to Synth so only
+# a sweep could fill them and no sweep did, and corrections.md assumed hand-editing that never
+# happens -- corrections arrive through Claude, add_facts and the Notes mirror. A file that
+# claims to hold binding beliefs and holds nothing is worse than no file.
+PROTECTED_DOCUMENTS = ["CLAUDE.md", "CONTEXT.md"]
 
 # Extensions Synth may write. Only extract.PLAIN round-trips losslessly; a .docx or .pdf is
 # extracted through MarkItDown or PDFKit and writing one back would destroy its formatting.

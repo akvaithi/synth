@@ -35,12 +35,37 @@ def _iso(dt: datetime) -> str:
 
 
 def _parse(ts: str) -> datetime | None:
+    """A timestamp as an AWARE datetime, reading a bare one as local time.
+
+    Naive input used to come back naive, and every comparison here is against something from
+    EventKit, which is always aware -- so `already_scheduled` and `conflicts` raised
+    "can't compare offset-naive and offset-aware datetimes" for `2026-09-02T09:00:00` and
+    worked for `2026-09-02T09:00:00-05:00`. Those two are the mandatory gates before every
+    write, and every other tool in Synth accepts a bare local date, so the bare form is what
+    a caller reaches for. A crashed gate is worse than a slow one: the failure it produced
+    was the duplicate check being skipped and the write going ahead anyway.
+
+    A bare datetime means Arun's zone, which is what he meant when he typed it, so
+    astimezone() attaches it here at the boundary rather than leaving every comparison below
+    to defend itself.
+    """
     if not ts:
         return None
     try:
-        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
     except ValueError:
         return None
+    return dt if dt.tzinfo else dt.astimezone()
+
+
+def _was_naive(ts: str) -> bool:
+    """Whether `ts` parsed but carried no offset, so local time was assumed for it."""
+    if not ts:
+        return False
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).tzinfo is None
+    except ValueError:
+        return False
 
 
 def tokens(title: str) -> set[str]:
@@ -284,6 +309,7 @@ def already_scheduled(title: str, when: str, window_minutes: int = 240) -> dict:
     if target is None:
         return {"checked": False, "reason": "unparseable time"}
     date = target.astimezone().strftime("%Y-%m-%d")
+    assumed = _was_naive(when)
     sched = day(date)
     want = tokens(title)
     duplicates, overlaps = [], []
@@ -309,6 +335,9 @@ def already_scheduled(title: str, when: str, window_minutes: int = 240) -> dict:
         db.localize(group, "when")
     return {
         "checked": True, "date": date,
+        # Say so when the caller gave a bare time and local was assumed for it, rather than
+        # leaving them to infer which zone the answer was computed in.
+        **({"assumed_timezone": db.tzname()} if assumed else {}),
         "matches": duplicates,
         "time_conflicts": overlaps,
         "verdict": ("likely already scheduled" if duplicates
@@ -341,7 +370,8 @@ def conflicts(start: str, minutes: int = 30) -> dict:
             out.append({"kind": "reminder", "title": r["title"], "due": r["due"]})
     db.localize(out, "start", "end", "due")
     return db.localize(
-        {"checked": True, "proposed": start, "minutes": minutes, "conflicts": out},
+        {"checked": True, "proposed": start, "minutes": minutes, "conflicts": out,
+         **({"assumed_timezone": db.tzname()} if _was_naive(start) else {})},
         "proposed")
 
 

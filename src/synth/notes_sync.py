@@ -93,8 +93,8 @@ def blocks_from_markdown(text: str) -> list:
     heading, a '- ' or '* ' bullet, and a paragraph. Consecutive bullets fold into one list,
     so a recipe's ingredients come out as a single <ul> rather than a run of one-item lists.
 
-    Shared by the brief renderer and by create_note/append_note, so a note Synth writes is
-    laid out the same way a brief is.
+    Shared by the mirror renderers and by create_note/append_note, so every note Synth writes
+    is laid out the same way.
     """
     blocks: list = []
     for line in (text or "").split("\n"):
@@ -143,13 +143,41 @@ def doc_obligations(conn) -> tuple[str, list]:
     return "Synth — Obligations", blocks
 
 
-def doc_programs(conn) -> tuple[str, list]:
+# How a free-text entity status maps onto the three notes. Anything unrecognised falls to
+# "active", because a status nobody has classified is more likely to be live than finished and
+# the cost of the two mistakes is not symmetric: a closed item shown as active is clutter, a
+# live one filed under closed is a missed deadline.
+STATUS_BUCKETS = {
+    "submitted": "submitted",
+    "applied": "submitted",
+    "awarded": "closed",
+    "declined": "closed",
+    "abandoned": "closed",
+    "closed": "closed",
+    "not pursued - on file only": "closed",
+}
+
+# Facts per entity in the mirror. The mirror is what Arun reads on a phone; it is not the
+# database. BS Chemical Engineering alone carries 94 live facts, and rendering them all is how
+# this note reached 88,565 characters.
+MIRROR_FACT_LIMIT = 12
+
+
+def _programs(conn, bucket: str, title: str) -> tuple[str, list]:
+    """One slice of the programs mirror.
+
+    Rendered whole, this note was 88,565 characters — re-composed on every sweep and useless on
+    a phone, which is the single thing the mirror exists for. Split by status, each slice is
+    something you can actually read to the end of.
+    """
     rows = conn.execute(
         "SELECT id, name, status, description FROM entity "
         "WHERE kind IN ('program','application','award') ORDER BY name"
     ).fetchall()
     blocks = []
     for r in rows:
+        if STATUS_BUCKETS.get((r["status"] or "").strip().casefold(), "active") != bucket:
+            continue
         blocks.append(("h", r["name"] + (f" — {r['status']}" if r["status"] else "")))
         if r["description"]:
             blocks.append(("p", r["description"]))
@@ -162,10 +190,25 @@ def doc_programs(conn) -> tuple[str, list]:
             blocks.append(("ul", [
                 f"{f['predicate']}: {f['value_text'] or f['value_date'] or f['value_num']}"
                 + ("" if f["confidence"] >= 0.99 else f"  (confidence {f['confidence']:.0%})")
-                for f in facts]))
+                for f in facts[:MIRROR_FACT_LIMIT]]))
+            if len(facts) > MIRROR_FACT_LIMIT:
+                blocks.append(("p", f"… and {len(facts) - MIRROR_FACT_LIMIT} more facts — "
+                                    f"ask Synth for the rest."))
     if not blocks:
-        blocks = [("p", "Nothing recorded yet.")]
-    return "Synth — Programs and Applications", blocks
+        blocks = [("p", "Nothing here.")]
+    return title, blocks
+
+
+def doc_programs_active(conn) -> tuple[str, list]:
+    return _programs(conn, "active", "Synth — Programs, Active")
+
+
+def doc_programs_submitted(conn) -> tuple[str, list]:
+    return _programs(conn, "submitted", "Synth — Programs, Submitted")
+
+
+def doc_programs_closed(conn) -> tuple[str, list]:
+    return _programs(conn, "closed", "Synth — Programs, Closed")
 
 
 def doc_people(conn) -> tuple[str, list]:
@@ -193,27 +236,11 @@ def doc_recent_actions(conn) -> tuple[str, list]:
     return "Synth — Activity", blocks
 
 
-def doc_brief(conn) -> tuple[str, list]:
-    """The latest brief, rendered where Arun will actually read it.
-
-    Until Remote Control is connected there is no push channel, so the Notes mirror is the
-    delivery mechanism, not merely an archive.
-    """
-    row = conn.execute(
-        "SELECT trigger, started_at, summary FROM run_log WHERE job = 'brief' "
-        "AND status = 'ok' AND summary IS NOT NULL ORDER BY id DESC LIMIT 1"
-    ).fetchone()
-    if row is None:
-        return "Synth — Brief", [("p", "No brief has run yet.")]
-    blocks = [("p", f"{row['trigger']} brief — {db.local(row['started_at'])}"), ("p", "")]
-    blocks.extend(blocks_from_markdown(row["summary"] or ""))
-    return "Synth — Brief", blocks
-
-
 DOCS = {
-    "brief": doc_brief,
     "obligations": doc_obligations,
-    "programs": doc_programs,
+    "programs_active": doc_programs_active,
+    "programs_submitted": doc_programs_submitted,
+    "programs_closed": doc_programs_closed,
     "people": doc_people,
     "activity": doc_recent_actions,
 }

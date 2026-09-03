@@ -271,7 +271,7 @@ def log_skip(conn, job: str, trigger: str, why: str) -> int:
 
 
 def summary(conn) -> str:
-    """One human-readable paragraph, for `synth budget` and for the brief."""
+    """One human-readable paragraph, for `synth budget` and for `synth status`."""
     s = state(conn)
     lines = [
         f"5-hour window : ${s['window_5h']['spend']:>7.2f} of ${config.BUDGET_5H:.2f}"

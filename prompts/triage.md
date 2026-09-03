@@ -21,7 +21,7 @@ For each message, exactly one:
   application, a meeting request, an opportunity with a closing date. Choose this when reading
   the body could change what Arun does.
 - **`digest`** — real but not actionable. He should know it arrived; nothing needs doing. It
-  will be named in his next brief with a link.
+  will be surfaced with a link when he asks about his mail.
 - **`ignore`** — marketing, bulk announcement, routine notification, receipt.
 
 **`act` must be rare.** Each one buys a full run that reads the body, checks his calendar and

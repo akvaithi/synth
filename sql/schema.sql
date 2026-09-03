@@ -54,6 +54,10 @@ CREATE TABLE IF NOT EXISTS assertion (
     id            INTEGER PRIMARY KEY,
     entity_id     INTEGER REFERENCES entity(id),
     predicate     TEXT NOT NULL,
+    -- predicate normalised by predicates.key(). Supersession matches on THIS, not on the
+    -- free-text predicate: keying on the string meant a fact rewritten under a marginally
+    -- different name superseded nothing and both stayed live for ever.
+    predicate_key TEXT,
     value_text    TEXT,
     value_num     REAL,
     value_date    TEXT,
@@ -65,6 +69,9 @@ CREATE TABLE IF NOT EXISTS assertion (
 );
 CREATE INDEX IF NOT EXISTS idx_assertion_live
     ON assertion (entity_id, predicate) WHERE superseded_by IS NULL;
+-- What facts.live() actually looks up now.
+CREATE INDEX IF NOT EXISTS idx_assertion_live_key
+    ON assertion (entity_id, predicate_key) WHERE superseded_by IS NULL;
 
 -- ---------------------------------------------------------------- actionable
 

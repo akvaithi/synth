@@ -7,9 +7,33 @@ can embarrass but cannot act.
 from __future__ import annotations
 
 import os
+import re
 
-from synth import actions, config, db, docwrite, facts, ingest
+from synth import actions, config, db, docwrite, facts, ingest, predicates
 from synth.applekit import call
+
+
+def _redact(rows: list[dict], include_sensitive: bool) -> int:
+    """Withhold the values of sensitive predicates in place; return how many were withheld.
+
+    The predicate is always left visible. Nothing is hidden -- the fact that Synth holds a UIN
+    is not the secret -- only the value is held back until it is asked for by name.
+    """
+    if include_sensitive:
+        return 0
+    n = 0
+    for r in rows:
+        if not predicates.is_sensitive(r.get("predicate") or ""):
+            continue
+        if r.get("value_text") is not None:
+            r["value_text"] = predicates.REDACTED
+        if r.get("value_num") is not None:
+            r["value_num"] = predicates.REDACTED
+        if r.get("value_date") is not None:
+            r["value_date"] = predicates.REDACTED
+        r["sensitive"] = True
+        n += 1
+    return n
 
 
 def _fts_escape(q: str) -> str:
@@ -21,20 +45,27 @@ def _fts_escape(q: str) -> str:
 # ---------------------------------------------------------------- reads
 
 
-def search_context(conn, query: str, limit: int = 20) -> dict:
+def search_context(conn, query: str, limit: int = 20,
+                   include_sensitive: bool = False) -> dict:
     q = _fts_escape(query)
     out: dict = {"query": query}
     out["entities"] = [dict(r) for r in conn.execute(
         "SELECT e.id, e.kind, e.name, e.description, e.status FROM entity_fts f "
         "JOIN entity e ON e.id = f.rowid WHERE entity_fts MATCH ? "
         "ORDER BY rank LIMIT ?", (q, limit))]
-    out["facts"] = [dict(r) for r in conn.execute(
+    facts_rows = [dict(r) for r in conn.execute(
         "SELECT a.id, a.predicate, a.value_text, a.value_date, a.confidence, "
         "  e.name AS entity, s.kind AS source_kind, s.native_id AS source "
         "FROM assertion_fts f JOIN assertion a ON a.id = f.rowid "
         "LEFT JOIN entity e ON e.id = a.entity_id LEFT JOIN source s ON s.id = a.source_id "
         "WHERE assertion_fts MATCH ? AND a.superseded_by IS NULL "
         "ORDER BY rank LIMIT ?", (q, limit))]
+    hidden = _redact(facts_rows, include_sensitive)
+    out["facts"] = facts_rows
+    if hidden:
+        out["redacted"] = hidden
+        out["note"] = (f"{hidden} fact value(s) withheld as sensitive — the predicate is "
+                       f"shown. Re-ask with include_sensitive=true if Arun wants the value.")
     out["documents"] = [dict(r) for r in conn.execute(
         "SELECT d.id, d.path, d.title, d.chars, snippet(document_fts, 1, '<<', '>>', ' … ', 24) AS excerpt "
         "FROM document_fts f JOIN document d ON d.id = f.rowid "
@@ -45,7 +76,19 @@ def search_context(conn, query: str, limit: int = 20) -> dict:
     return out
 
 
-def get_entity(conn, name: str) -> dict:
+def get_entity(conn, name: str, limit: int = 60, predicate: str = "",
+               include_sensitive: bool = False) -> dict:
+    """Everything known about one entity, bounded and with sensitive values withheld.
+
+    Unbounded, this returned about 150 facts and 75 relations for the hub entity in a single
+    payload -- a large fraction of a context window for a question that was usually about one
+    of them -- and it printed the UIN, date of birth, ISD student ID, home address and a
+    parent's name in plain text along the way. Neither was ever asked for.
+
+    `limit` and `predicate` narrow it; `include_sensitive` is the deliberate act required to
+    see a withheld value. The totals are always reported, so a bounded answer can never be
+    mistaken for a complete one.
+    """
     row = conn.execute(
         "SELECT * FROM entity WHERE name = ? COLLATE NOCASE", (name,)).fetchone()
     if row is None:
@@ -54,31 +97,86 @@ def get_entity(conn, name: str) -> dict:
             "WHERE entity_fts MATCH ? LIMIT 5", (_fts_escape(name),))]
         return {"found": False, "name": name, "did_you_mean": near}
     eid = row["id"]
-    return {
+
+    where, params = "a.entity_id = ? AND a.superseded_by IS NULL", [eid]
+    if predicate:
+        where += " AND a.predicate LIKE ?"
+        params.append(f"%{predicate}%")
+    total = conn.execute(f"SELECT count(*) FROM assertion a WHERE {where}", params).fetchone()[0]
+    facts_rows = [dict(r) for r in conn.execute(
+        "SELECT a.predicate, a.value_text, a.value_num, a.value_date, a.confidence, "
+        "  a.mail_derived, a.observed_at, s.kind AS source_kind, s.native_id AS source "
+        f"FROM assertion a LEFT JOIN source s ON s.id = a.source_id WHERE {where} "
+        "ORDER BY a.predicate LIMIT ?", params + [limit])]
+    hidden = _redact(facts_rows, include_sensitive)
+
+    rel_total = conn.execute(
+        "SELECT count(*) FROM edge WHERE src_id = ? OR dst_id = ?", (eid, eid)).fetchone()[0]
+    related = [dict(r) for r in conn.execute(
+        "SELECT g.relation, e2.kind, e2.name FROM edge g JOIN entity e2 ON e2.id = g.dst_id "
+        "WHERE g.src_id = ? UNION ALL "
+        "SELECT g.relation, e2.kind, e2.name FROM edge g JOIN entity e2 ON e2.id = g.src_id "
+        "WHERE g.dst_id = ? LIMIT ?", (eid, eid, limit))]
+
+    out = {
         "found": True,
         "entity": dict(row),
-        "facts": [dict(r) for r in conn.execute(
-            "SELECT a.predicate, a.value_text, a.value_num, a.value_date, a.confidence, "
-            "  a.mail_derived, a.observed_at, s.kind AS source_kind, s.native_id AS source "
-            "FROM assertion a LEFT JOIN source s ON s.id = a.source_id "
-            "WHERE a.entity_id = ? AND a.superseded_by IS NULL ORDER BY a.predicate", (eid,))],
-        "related": [dict(r) for r in conn.execute(
-            "SELECT g.relation, e2.kind, e2.name FROM edge g JOIN entity e2 ON e2.id = g.dst_id "
-            "WHERE g.src_id = ? UNION ALL "
-            "SELECT g.relation, e2.kind, e2.name FROM edge g JOIN entity e2 ON e2.id = g.src_id "
-            "WHERE g.dst_id = ?", (eid, eid))],
+        "facts": facts_rows,
+        "facts_total": total,
+        "facts_shown": len(facts_rows),
+        "related": related,
+        "related_total": rel_total,
         "obligations": [dict(r) for r in conn.execute(
             "SELECT title, due, status FROM obligation WHERE entity_id = ? ORDER BY due", (eid,))],
         "links": [dict(r) for r in conn.execute(
             "SELECT url, title, kind FROM link WHERE entity_id = ? AND dismissed = 0", (eid,))],
     }
+    db.localize(out["obligations"], "due")
+    notes = []
+    if total > len(facts_rows):
+        notes.append(f"{total - len(facts_rows)} more fact(s) not shown — raise `limit`, or "
+                     f"pass `predicate` to narrow to what you are actually after.")
+    if rel_total > len(related):
+        notes.append(f"{rel_total - len(related)} more relation(s) not shown.")
+    if hidden:
+        out["redacted"] = hidden
+        notes.append(f"{hidden} value(s) withheld as sensitive; the predicates are listed. "
+                     f"Pass include_sensitive=true only when Arun asked for that value.")
+    if notes:
+        out["note"] = " ".join(notes)
+    return out
 
 
-def fact_history(conn, name: str, predicate: str) -> dict:
+def fact_history(conn, name: str, predicate: str, include_sensitive: bool = False) -> dict:
+    """Every value one predicate has held on one entity, newest first.
+
+    An unknown predicate used to return found:true with an empty list, exactly as a predicate
+    that genuinely never changed does -- so "no history" and "wrong name" were indistinguishable
+    and there was nothing to correct from. The available predicates come back instead, which
+    makes the tool self-correcting.
+    """
     row = conn.execute("SELECT id FROM entity WHERE name = ? COLLATE NOCASE", (name,)).fetchone()
     if row is None:
-        return {"found": False}
-    return {"found": True, "history": facts.history(conn, row["id"], predicate)}
+        near = [r["name"] for r in conn.execute(
+            "SELECT e.name FROM entity_fts f JOIN entity e ON e.id = f.rowid "
+            "WHERE entity_fts MATCH ? LIMIT 5", (_fts_escape(name),))]
+        return {"found": False, "name": name, "did_you_mean": near}
+    history = facts.history(conn, row["id"], predicate)
+    _redact(history, include_sensitive)
+    if history:
+        return {"found": True, "entity": name, "predicate": predicate, "history": history}
+    # Matched on the normalised key, so a near-miss spelling already resolved. Reaching here
+    # means the predicate genuinely is not on this entity.
+    available = [r["predicate"] for r in conn.execute(
+        "SELECT DISTINCT predicate FROM assertion WHERE entity_id = ? AND superseded_by IS NULL "
+        "ORDER BY predicate", (row["id"],))]
+    close = sorted(available, key=lambda p: -predicates.similar(p, predicate))[:8]
+    return {"found": True, "entity": name, "predicate": predicate, "history": [],
+            "error": f"{name!r} has no predicate matching {predicate!r}.",
+            "did_you_mean": close,
+            "available_predicates": available,
+            "note": "An empty history here means the predicate was not found, not that the "
+                    "value never changed. Pick one of the names above."}
 
 
 def list_obligations(conn, status: str = "open", limit: int = 100) -> list[dict]:
@@ -102,8 +200,27 @@ def read_document(conn, doc_id: int = None, path: str = None, max_chars: int = 2
 
 
 def today(conn) -> dict:
+    """Events for the next 24 hours and every open reminder, live from EventKit.
+
+    Named for a day and it is not one: `days=1` is a rolling window from now, so at 10pm on the
+    1st it returns the 2nd's events and nothing from the 1st. That is the useful behaviour --
+    "what is coming" beats "what is left of today" at almost every hour -- but the name promises
+    a calendar day, so the window it actually covers is stated in the payload rather than left
+    to be inferred from the results. Use `agenda` when you want a named day.
+    """
+    from datetime import datetime, timedelta
+
+    now = datetime.now().astimezone()
+    window = {"from": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "from_local": now.strftime(db.LOCAL_FMT),
+              "to_local": (now + timedelta(days=1)).strftime(db.LOCAL_FMT)}
     return {
         "timezone": db.tzname(),
+        "date": now.strftime("%Y-%m-%d"),
+        "window": window,
+        "note": ("`events` covers the next 24 hours from now, NOT the calendar day — late in "
+                 "the evening that is mostly tomorrow. `reminders` is every open reminder "
+                 "regardless of date. For a named day, call agenda."),
         "events": db.localize(call("events", days=1, timeout=120), "start", "end", "lastModified"),
         "reminders": db.localize(call("reminders", timeout=180), "due", "lastModified"),
     }
@@ -112,9 +229,9 @@ def today(conn) -> dict:
 def _unpack_state(d: dict) -> dict:
     """Return the before/after blobs as objects with their times localised.
 
-    The audit surface is read straight into the brief's "what Synth did" section, and the
-    times that matter there -- when a reminder it created is actually due -- live inside these
-    JSON strings, where localize cannot reach them. Handed over as raw UTC they get converted
+    The audit surface is what answers "what has Synth done", and the times that matter there
+    -- when a reminder it created is actually due -- live inside these JSON strings, where
+    localize cannot reach them. Handed over as raw UTC they get converted
     by hand and land a day out: a reminder due Thursday 7pm was reported as Wednesday.
     """
     import json as _json
@@ -202,7 +319,7 @@ def _same_title(title: str, list_name: str | None, existing: list[dict]) -> dict
 
 
 def _refuse_duplicate(title: str, due: str | None, list_name: str | None,
-                      existing: list[dict] | None = None) -> tuple[dict | None, list]:
+                      existing: list[dict] | None = None) -> tuple[dict | None, list, str | None]:
     """The duplicate check that fits the kind of thing being created, or None to go ahead.
 
     An appointment — something with a due *time* — is checked against everything near that
@@ -214,14 +331,19 @@ def _refuse_duplicate(title: str, due: str | None, list_name: str | None,
     matching the last. So anything untimed, date-only, or on a list-style list gets an exact
     title match within its own list instead — which is the duplicate that actually happens on
     a list. Milk twice.
+
+    The third element of the return is the check's own failure, when it had one. It used to be
+    swallowed into an empty result, which is the worst possible reading of it: a gate that
+    crashed reported "nothing similar found" and the write went ahead as though it had been
+    checked. A gate that cannot run must say so loudly enough that the caller stops.
     """
     timed = bool(due) and "T" in due
     if timed and list_name not in config.LIST_STYLE_LISTS:
         from synth import agenda as _a
         try:
             check = _a.already_scheduled(title, due)
-        except Exception:
-            check = {"matches": [], "time_conflicts": []}
+        except Exception as e:
+            return None, [], f"{type(e).__name__}: {e}"
         overlaps = check.get("time_conflicts") or []
         if check.get("matches"):
             m = check["matches"][0]
@@ -230,10 +352,10 @@ def _refuse_duplicate(title: str, due: str | None, list_name: str | None,
                                f"{m['minutes_apart']} minutes from the proposed time, and "
                                f"they share {m['shared_words']}. Do nothing unless this is "
                                f"genuinely a different commitment, in which case pass "
-                               f"force=true and say why in the reason.")}, overlaps
+                               f"force=true and say why in the reason.")}, overlaps, None
         # Something close in time sharing no word is an overlap, not a duplicate. It used to
         # refuse the write; now it rides along on the success so it can be reported.
-        return None, overlaps
+        return None, overlaps, None
 
     dup = _same_title(title, list_name, existing if existing is not None
                       else call("reminders", timeout=240))
@@ -243,16 +365,85 @@ def _refuse_duplicate(title: str, due: str | None, list_name: str | None,
                           "id": dup["id"], "due": dup.get("due") or None},
                 "advice": (f"{dup['title']!r} is already on {dup['list']}. Do nothing unless "
                            f"this is genuinely a second one, in which case pass force=true "
-                           f"and say why in the reason.")}, []
-    return None, []
+                           f"and say why in the reason.")}, [], None
+    return None, [], None
+
+
+# Words too common across entity names to identify one. Without these, "scholarship" or
+# "application" would look distinctive on any entity that happened to be the only one carrying
+# it this week, and the link would change as the table grew.
+_ENTITY_STOP = {
+    "the", "and", "for", "texas", "university", "application", "applications", "scholarship",
+    "scholarships", "award", "awards", "program", "programs", "project", "projects",
+    "internship", "research", "summer", "spring", "fall", "student", "students",
+    "engineering", "college", "minor", "school", "council", "competition", "simulation",
+}
+
+
+def _match_entity(conn, title: str) -> int | None:
+    """The entity a reminder's title names, if it plainly names one.
+
+    18 of 20 obligations carried entity_id NULL, so get_entity("Goldwater Scholarship") showed
+    no obligations while one sat in the table due 8 September -- and that link is most of what
+    makes get_entity worth calling.
+
+    Two rules, both conservative, because a wrong link is worse than no link: no link is
+    visibly absent, a wrong one is invisible once made.
+
+    First, the whole entity name appearing inside the title. That is almost always that
+    entity, and the longest match wins so "Goldwater Scholarship" beats a bare "Goldwater".
+
+    Second, a DISTINCTIVE NAME TOKEN: a word that belongs to exactly one entity in the whole
+    table and is part of that entity's identifying name -- its first two words -- rather than
+    a descriptor further along. This is what links "Goldwater — build the independent-
+    contributions answer" to Goldwater Scholarship, which the substring rule misses because the
+    reminder never says "Scholarship".
+
+    The name restriction is doing real work. Without it, uniqueness alone matched "Fill out
+    2026 Engineering Art Competition form" to the SEC Ignite Engineering Design Competition on
+    the word "competition" -- a different competition entirely -- and a resume reminder to a
+    project on "simulation". A word deep in a descriptive name is not that entity's name.
+    """
+    hay = " ".join((title or "").split()).casefold()
+    if not hay:
+        return None
+    words = re.findall(r"[a-z0-9]+", hay)
+
+    rows = [(r["id"], " ".join((r["name"] or "").split()).casefold())
+            for r in conn.execute("SELECT id, name FROM entity")]
+
+    best, best_len = None, 0
+    for eid, name in rows:
+        # Three characters is below the length at which a name is distinctive: an entity
+        # called "AI" would otherwise match half the list.
+        if len(name) > 3 and name in hay and len(name) > best_len:
+            best, best_len = eid, len(name)
+    if best is not None:
+        return best
+
+    owners: dict[str, set] = {}
+    leading: dict[int, set] = {}
+    for eid, name in rows:
+        parts = re.findall(r"[a-z0-9]+", name)
+        leading[eid] = set(parts[:2])
+        for w in parts:
+            if len(w) >= 4 and w not in _ENTITY_STOP:
+                owners.setdefault(w, set()).add(eid)
+
+    hits = {eid for w in words
+            for eid in ([next(iter(owners[w]))] if len(owners.get(w, ())) == 1 else [])
+            if w in leading[next(iter(owners[w]))]}
+    # Two candidates means the title names two different things; guessing between them is
+    # exactly the wrong link this function exists to avoid.
+    return hits.pop() if len(hits) == 1 else None
 
 
 def _file_obligation(conn, title: str, due, ek_id: str, entity_id=None,
                      externally_set: bool = False) -> None:
     """Record a reminder as an obligation — unless it is a line on a list.
 
-    An obligation is something owed, and it shows up as one: in list_obligations, in the
-    Notes mirror, in every brief until it is closed. A grocery item is not owed to anyone, and
+    An obligation is something owed, and it shows up as one: in list_obligations and in the
+    Notes mirror, until it is closed. A grocery item is not owed to anyone, and
     twenty-nine of them would bury the four things that are.
     """
     conn.execute(
@@ -281,33 +472,6 @@ def add_facts(conn, payload: dict, source_kind: str = "conversation",
     return facts.ingest_batch(conn, payload, source_id=sid, mail_derived=mail_derived)
 
 
-def import_reminders(conn, run_id=None) -> dict:
-    """Record existing reminders as obligations, linked by EventKit identifier.
-
-    This creates nothing in Reminders — it joins what is already there to the database, so
-    that obligations and the reminders Arun actually looks at are the same objects. Matching
-    to entities is left to a later pass; the link itself is what matters.
-    """
-    existing = {r["ek_identifier"] for r in conn.execute(
-        "SELECT ek_identifier FROM obligation WHERE ek_identifier IS NOT NULL")}
-    added = 0
-    for r in call("reminders", timeout=300):
-        if r["id"] in existing:
-            continue
-        conn.execute(
-            "INSERT INTO obligation (title, due, status, ek_identifier, ek_kind, "
-            "externally_set) VALUES (?,?,?,?,'reminder',0) "
-            "ON CONFLICT (ek_identifier) DO NOTHING",
-            (r["title"], r["due"] or None, "open", r["id"]))
-        added += 1
-    conn.commit()
-    if added:
-        db.log_action(conn, "import_reminders", "db",
-                      f"link {added} existing reminder(s) to obligations by identifier",
-                      run_id=run_id, after={"count": added})
-    return {"imported": added, "already_linked": len(existing)}
-
-
 def create_reminder(conn, title: str, reason: str, due: str = None, list: str = None,
                     notes: str = None, entity: str = None, externally_set: bool = False,
                     force: bool = False, run_id=None, evidence_id=None) -> dict:
@@ -323,9 +487,9 @@ def create_reminder(conn, title: str, reason: str, due: str = None, list: str = 
     # proposed time happened to clash.
     actions._require_reason(reason)
     lst = _resolve_list(list)
-    overlaps = []
+    overlaps, gate_failed = [], None
     if not force:
-        refusal, overlaps = _refuse_duplicate(title, due, lst)
+        refusal, overlaps, gate_failed = _refuse_duplicate(title, due, lst)
         if refusal:
             return refusal
     action_id, result = actions.create_reminder(
@@ -337,11 +501,21 @@ def create_reminder(conn, title: str, reason: str, due: str = None, list: str = 
         row = conn.execute("SELECT id FROM entity WHERE name = ? COLLATE NOCASE",
                            (entity,)).fetchone()
         eid = row["id"] if row else None
+    if eid is None:
+        # Nothing named, or a name that matched nothing. Read the entity out of the title
+        # rather than filing yet another obligation with no link to what it is about.
+        eid = _match_entity(conn, title)
     if lst not in config.LIST_STYLE_LISTS:
         _file_obligation(conn, title, created.get("due"), created["id"], eid, externally_set)
     conn.commit()
     # Same shape as the refusal path, so a caller can always read `created` to know.
     out = {"created": True, "action_id": action_id, "reminder": created}
+    if gate_failed:
+        out["duplicate_check_failed"] = gate_failed
+        out["advice"] = (
+            "The duplicate check could not run, so this was NOT checked against what is "
+            "already scheduled — it was created unchecked. Tell Arun so, and check the day "
+            "with agenda before creating anything else at that time.")
     if overlaps:
         out["time_conflicts"] = overlaps
         out["note"] = ("This shares the hour with something already scheduled but nothing in "
@@ -405,7 +579,10 @@ def create_reminders(conn, titles: list, reason: str, list: str = None, due: str
             run_id=run_id, evidence_id=evidence_id)
         made = result["created"]
         if lst not in config.LIST_STYLE_LISTS:
-            _file_obligation(conn, title, made.get("due"), made["id"], eid)
+            # One `entity` covers the batch when given; otherwise each title is read on its
+            # own, because a batch of unrelated tasks has no single entity.
+            _file_obligation(conn, title, made.get("due"), made["id"],
+                             eid if eid is not None else _match_entity(conn, title))
         created.append(made)
         action_ids.append(action_id)
     conn.commit()
@@ -430,8 +607,8 @@ def complete_reminder(conn, ek_identifier: str, reason: str, evidence_source: st
 def update_reminder(conn, ek_identifier: str, reason: str, run_id=None, **fields) -> dict:
     """Edit an existing reminder. Partial: a field not named is never cleared.
 
-    The first brief could not fix three reminders that had a date but no time, because no
-    edit tool was exposed. An untimed reminder never appears in Calendar, which is where
+    Three reminders once had a date but no time and could not be fixed, because no edit tool
+    was exposed. An untimed reminder never appears in Calendar, which is where
     Arun reads his day, so this matters more than it looks.
     """
     action_id, result = actions.update_reminder(
@@ -460,12 +637,15 @@ def create_event(conn, title: str, start: str, reason: str, end: str = None,
     if cal not in config.MANAGED_CALENDARS:
         raise ValueError(
             f"{cal!r} is not a managed calendar; expected one of {config.MANAGED_CALENDARS}")
+    gate_failed = None
     if not force:
         from synth import agenda as _a
         try:
             check = _a.already_scheduled(title, start)
-        except Exception:
-            check = {"matches": []}
+        except Exception as e:
+            # Never swallowed into an empty result. An event cannot be deleted afterwards, so
+            # a gate that failed silently here is the most expensive silence in Synth.
+            check, gate_failed = {"matches": []}, f"{type(e).__name__}: {e}"
         if check.get("matches"):
             m = check["matches"][0]
             return {"created": False, "refused": "already scheduled",
@@ -482,15 +662,22 @@ def create_event(conn, title: str, start: str, reason: str, end: str = None,
     created = result["created"]
     # No obligation row. An event is a commitment, not a task, and nothing reconciles event
     # state back from EventKit — an 'open' row for a meeting that simply happened would sit
-    # in every brief as overdue, which is the exact bug sync_obligations was written to fix.
+    # in every reading of his obligations as overdue, which is the exact bug sync_obligations
+    # was written to fix.
     out = {"created": True, "action_id": action_id, "event": created}
+    if gate_failed:
+        out["duplicate_check_failed"] = gate_failed
+        out["advice"] = (
+            "The already-scheduled check could not run, so this event was NOT checked against "
+            "the calendar — it was created unchecked, and there is no way to delete an event. "
+            "Tell Arun immediately so he can remove it if it is a duplicate.")
     try:
         from synth import agenda as _a
         clash = _a.conflicts(created["start"], minutes=45)
         if clash.get("conflicts"):
             out["conflicts"] = clash["conflicts"]
             out["note"] = ("This lands on top of something already scheduled. It was still "
-                           "created — say so in the brief so Arun can decide.")
+                           "created — tell Arun so he can decide.")
     except Exception:
         pass
     return out
@@ -551,9 +738,56 @@ def sync_obligations(conn, run_id=None) -> dict:
 
     EventKit is the source of truth for state here -- for the due date and title as much as
     for completion -- and the database holds the reasoning.
+
+    It also ADOPTS. Reconciliation only ever looked at reminders it already knew about, so
+    every log line named completions, deletions, reopens and re-dates and never once an
+    ingest: 20 tracked obligations against roughly 37 open reminders, with "Fill out 2026
+    Engineering Art Competition form" the clean proof -- Synth edited its due time on 25
+    August and still never took it on. The obligations note says "N open", which reads as a
+    complete picture, and until now it was not one.
+
+    Adoption records and nothing else. It creates nothing in Reminders and changes nothing of
+    Arun's; it joins what is already there to the database so the two are the same objects.
     """
     live = {r["id"]: r for r in call("reminders", includeCompleted=True, timeout=300)}
     completed, vanished, reopened, redated = [], [], [], []
+    known = {r["ek_identifier"] for r in conn.execute(
+        "SELECT ek_identifier FROM obligation WHERE ek_identifier IS NOT NULL")}
+
+    # Adopt first, so anything taken on this sweep is reconciled by the loop below in the same
+    # pass rather than waiting half an hour for the next one.
+    adopted, linked = [], []
+    for r in live.values():
+        if r["id"] in known or r.get("completed"):
+            continue
+        if (r.get("list") or "") in config.LIST_STYLE_LISTS:
+            # A grocery item is not owed to anyone, and twenty-nine of them would bury the
+            # four things that are. Same carve-out create_reminder already makes.
+            continue
+        title = (r.get("title") or "").strip()
+        if not title:
+            continue
+        # externally_set stays 0: adoption cannot know whether a date was imposed or chosen,
+        # and claiming it was imposed would put a self-set target under "Real deadlines".
+        _file_obligation(conn, title, r.get("due") or None, r["id"],
+                         _match_entity(conn, title), externally_set=False)
+        adopted.append(title)
+
+    # Backfill the link for obligations that never got one. Idempotent -- an obligation whose
+    # title names no entity is simply left alone and retried next sweep, which costs one
+    # substring pass over a table of a few hundred rows.
+    for o in conn.execute(
+        "SELECT ek_identifier, title FROM obligation "
+        "WHERE entity_id IS NULL AND status IN ('open','waiting')"
+    ).fetchall():
+        eid = _match_entity(conn, o["title"])
+        if eid is None:
+            continue
+        conn.execute("UPDATE obligation SET entity_id = ?, updated_at = ? "
+                     "WHERE ek_identifier = ?", (eid, db.now(), o["ek_identifier"]))
+        name = conn.execute("SELECT name FROM entity WHERE id = ?", (eid,)).fetchone()["name"]
+        linked.append(f"{o['title'][:40]} -> {name}")
+
     for o in conn.execute(
         "SELECT ek_identifier, title, due, status FROM obligation "
         "WHERE ek_identifier IS NOT NULL AND ek_kind = 'reminder'"
@@ -591,22 +825,27 @@ def sync_obligations(conn, run_id=None) -> dict:
                 redated.append(f"{live_title[:44]}: {db.local(o['due']) or 'no date'} -> "
                                f"{db.local(live_due) or 'no date'}")
     conn.commit()
-    if completed or vanished or reopened or redated:
-        # Name them in the reason itself. "9 completed by Arun" told the brief a number but
-        # not which, so it had to report that it could not say -- and Arun's standing rule is
-        # that nothing Synth does goes unnamed.
+    if completed or vanished or reopened or redated or adopted or linked:
+        # Name them in the reason itself. "9 completed by Arun" gives a number but not which,
+        # so anything reading the log has to report that it cannot say -- and Arun's standing
+        # rule is that nothing Synth does goes unnamed.
         named = "; ".join(t[:48] for t in (completed + reopened)[:12])
         db.log_action(conn, "sync_obligations", "db",
-                      f"reconciled against Reminders: {len(completed)} completed by Arun, "
+                      f"reconciled against Reminders: {len(adopted)} adopted, "
+                      f"{len(completed)} completed by Arun, "
                       f"{len(vanished)} deleted, {len(reopened)} reopened, "
-                      f"{len(redated)} re-dated"
+                      f"{len(redated)} re-dated, {len(linked)} linked to an entity"
                       + (f" — {named}" if named else "")
-                      + (f" | dates: {'; '.join(redated[:6])}" if redated else ""),
+                      + (f" | adopted: {'; '.join(t[:44] for t in adopted[:8])}"
+                         if adopted else "")
+                      + (f" | dates: {'; '.join(redated[:6])}" if redated else "")
+                      + (f" | linked: {'; '.join(linked[:6])}" if linked else ""),
                       run_id=run_id,
-                      after={"completed": completed, "vanished": vanished,
-                             "reopened": reopened, "redated": redated})
-    return {"completed_by_arun": completed, "deleted": vanished, "reopened": reopened,
-            "redated": redated}
+                      after={"adopted": adopted, "completed": completed,
+                             "vanished": vanished, "reopened": reopened,
+                             "redated": redated, "linked": linked})
+    return {"adopted": adopted, "completed_by_arun": completed, "deleted": vanished,
+            "reopened": reopened, "redated": redated, "linked_to_entity": linked}
 
 
 def agenda(conn, start: str = "", end: str = "", date: str = "") -> dict:
@@ -732,7 +971,8 @@ def read_note(conn, doc: str = "", note_id: str = "", folder: str = "",
               name: str = "") -> dict:
     """Read a note's current body.
 
-    Three ways in: `doc` for one of the mirror documents, which is the channel for corrections
+    Three ways in: `doc` for one of the mirror documents (obligations, programs_active,
+    programs_submitted, programs_closed, people, activity), which is the channel for corrections
     Arun types into the Synth folder; `note_id` for one already identified; `folder` with
     `name` for anything else.
     """
@@ -772,8 +1012,8 @@ def create_note(conn, name: str, body: str, reason: str, folder: str = "",
                 run_id=None) -> dict:
     """Create a note in Notes. Refuses to overwrite one that is already there.
 
-    `body` is written the way a brief is — '#' headings, '- ' bullets, paragraphs — so what
-    lands in Notes reads as prose rather than as markdown source.
+    `body` takes '#' headings, '- ' bullets and paragraphs, so what lands in Notes reads as
+    prose rather than as markdown source.
     """
     actions._require_reason(reason)
     if not name or not name.strip():
@@ -1058,11 +1298,15 @@ def enrich_documents(conn, extra_limit: int = 0, dry_run: bool = False) -> dict:
     """
     from synth import enrich
 
-    docs = enrich.select(conn, extra_limit=extra_limit)
+    docs, skipped = enrich.select_with_skipped(conn, extra_limit=extra_limit)
     if dry_run or not docs:
         return {"selected": len(docs), "dry_run": True,
                 "documents": [{"id": d["id"], "path": d["path"], "chars": d["chars"]}
-                              for d in docs]}
+                              for d in docs],
+                "excluded": skipped,
+                "note": ("`excluded` is what enrichment refuses to read and why: superseded "
+                         "resumes, which would enter the database as today's evidence, and "
+                         "other people's application material.")}
     results = enrich.run(conn, docs)
     return {"selected": len(docs), "batches": len(results),
             "errors": sum(1 for r in results if r.get("error")),

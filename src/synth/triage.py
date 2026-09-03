@@ -13,10 +13,10 @@ So the first pass is pure Python and free. It has four outcomes:
 
     urgent    -- act now, skip the batching window entirely
     consider  -- worth a cheap subject-line look from Haiku
-    digest    -- named in the next brief, never given a model run
-    ignore    -- named in the next brief in one line, nothing more
+    digest    -- recorded in the index, never given a model run
+    ignore    -- recorded in one line, nothing more
 
-Nothing is discarded. `digest` and `ignore` both land in `mail_digest`, which the brief reads,
+Nothing is discarded. `digest` and `ignore` both land in `mail_digest`, which is read when he asks,
 because Arun's standing rule is that nothing flies under the radar.
 
 What makes the urgent rules trustworthy is the context database. It already knows that
@@ -78,7 +78,7 @@ NOISE_SUBJECT = re.compile(
     r"transaction alert|your card ending|payment (received|posted|due reminder)|"
     r"statement is (now )?available|balance alert)\b", re.IGNORECASE)
 
-# Routine account security mail. Named in the brief, never given a run -- the reactor already
+# Routine account security mail. Recorded in the index, never given a run -- the sweep already
 # read eight of these in one batch and concluded they were routine sign-ins.
 SECURITY_SUBJECT = re.compile(
     r"\b(new sign[- ]?in|security alert|was this you|verify your (email|identity)|"
@@ -86,7 +86,7 @@ SECURITY_SUBJECT = re.compile(
     re.IGNORECASE)
 
 # Automated job-alert blasts. Arun applies to a great many things and has said plainly that
-# tracking every one of these is a waste; the brief names them, nothing reads them.
+# tracking every one of these is a waste; the index names them, nothing reads them.
 JOB_ALERT = re.compile(r"job[-_.]?alerts?|jobs?[-_.]?noreply|talent[-_.]?alerts?",
                        re.IGNORECASE)
 JOB_ALERT_SUBJECT = re.compile(
@@ -308,7 +308,7 @@ def learn(conn) -> dict:
 
 
 def hold(conn, messages: list[dict]) -> int:
-    """Park filtered mail where the next brief will find it."""
+    """Park filtered mail where the next question about his inbox will find it."""
     n = 0
     for m in messages:
         conn.execute(
@@ -334,14 +334,14 @@ def unreported(conn, limit: int = 80) -> list[dict]:
 def fill_links(conn, rows: list[dict], cap: int = 12) -> None:
     """Pull destination URLs out of filtered mail without spending a token.
 
-    Arun's rule is that a brief hands him the link rather than the email. Letting the model
+    Arun's rule is that he is handed the link rather than the email. Letting the model
     fetch them cost a whole brief: it spent thirty-one turns calling mail_links per message,
     hit its turn limit and produced nothing at all. Parsing HTML is Python's job.
 
     Indexes are resolved fresh rather than trusted from when the message was filed, because
     a mailbox index moves every time mail arrives. The daemon verifies the Message-ID and
     refuses a mismatch, so a stale index is safe -- it simply returns nothing, which is the
-    quiet failure that leaves a brief linkless for no visible reason.
+    quiet failure that leaves an answer linkless for no visible reason.
     """
     from synth import maillinks
     from synth.applekit import call

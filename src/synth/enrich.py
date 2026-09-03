@@ -26,10 +26,47 @@ PRIORITY_PATTERNS = [
     ("degree-eval", "%DEGREE-EVAL%"),
 ]
 
+# Folders enrichment must never read, matched on the start of the path.
+#
+# Superseded/ is the one that did damage. A superseded resume is read with today's
+# observed_at, so an old resume enters the database as the most recent evidence and supersedes
+# the correction that replaced it -- facts about the math minor and a 3.918 GPA sit at
+# confidence 1.0 alongside the corrections, sourced from files Arun had already retired.
+#
+# The Goldwater folder is other students' application material, kept as writing samples, with
+# a README beside it saying not to redistribute. Nothing has leaked -- no entity was ever made
+# for either author -- but nothing prevented the next pass from extracting their personal
+# details as facts about people who never asked to be in this database.
+EXCLUDE_PREFIXES = [
+    "Career/Resume & Applications/Superseded/",
+    "Archive/College Applications/",
+    "Academics/Scholarships/Goldwater - Example Applications/",
+]
+
 # Paths that match a priority pattern but are not *about* Arun -- generic workshop decks,
 # bookmarks, other people's application material kept as writing samples.
+#
+# "Goldwater Examples" was here and matched nothing: the folder is called "Goldwater - Example
+# Applications". An exclusion that silently matches nothing is worse than none, because it
+# reads as covered.
 EXCLUDE_SUBSTRINGS = ["Workshop", "Career Center", ".url", "other students",
-                      "Goldwater Examples", "Sample"]
+                      "Example Applications", "Superseded/", "Sample"]
+
+
+def excluded(path: str) -> str | None:
+    """Why this document is not enrichment's to read, or None if it is.
+
+    Returns the reason rather than a bool so both the caller and the dry run can say WHICH
+    rule kept a file out -- an exclusion nobody can see the effect of is one nobody notices
+    has stopped working.
+    """
+    for prefix in EXCLUDE_PREFIXES:
+        if path.lower().startswith(prefix.lower()):
+            return f"under {prefix}"
+    for frag in EXCLUDE_SUBSTRINGS:
+        if frag.lower() in path.lower():
+            return f"path contains {frag!r}"
+    return None
 
 # Reached through `synth call`, not MCP. These were mcp__synth__* names until the VM side
 # stopped loading MCP servers on 2026-08-23 (--strict-mcp-config with no --mcp-config loads
@@ -39,11 +76,23 @@ ENRICH_TOOLS = list(runner.DIRECT_TOOLS)
 
 
 def select(conn, extra_limit: int = 0) -> list[dict]:
-    """The curated set: the distilled context documents first, then degree and record
-    material. The folder was called Archive/Consort until 2026-09-01, after the system that
-    exported it; the documents are the same ones."""
+    """The curated set, without the exclusion report. See select_with_skipped."""
+    return select_with_skipped(conn, extra_limit)[0]
+
+
+def select_with_skipped(conn, extra_limit: int = 0) -> tuple[list[dict], list[dict]]:
+    """The curated set and what was deliberately left out of it.
+
+    The distilled context documents first, then degree and record material. The folder was
+    called Archive/Consort until 2026-09-01, after the system that exported it; the documents
+    are the same ones.
+
+    The second return is every document an exclusion rule kept out, with the rule that did it,
+    so `dry_run` can show it. An exclusion whose effect is invisible is one nobody notices has
+    stopped matching -- which is exactly how "Goldwater Examples" sat here matching nothing.
+    """
     done = {r[0] for r in conn.execute("SELECT document_id FROM enrichment")}
-    seen, chosen = set(done), []
+    seen, chosen, skipped = set(done), [], []
     for label, pattern in PRIORITY_PATTERNS:
         for r in conn.execute(
             "SELECT id, path, title, chars FROM document WHERE path LIKE ? "
@@ -51,22 +100,39 @@ def select(conn, extra_limit: int = 0) -> list[dict]:
         ):
             if r["id"] in seen or r["chars"] < 200:
                 continue
-            if any(x.lower() in r["path"].lower() for x in EXCLUDE_SUBSTRINGS):
+            why = excluded(r["path"])
+            if why:
+                seen.add(r["id"])
+                skipped.append({"id": r["id"], "path": r["path"], "why": why})
                 continue
             seen.add(r["id"])
             chosen.append({"id": r["id"], "path": r["path"], "chars": r["chars"],
                            "label": label})
     if extra_limit:
+        # The exclusions were checked in the loop above and NOT here, which is the hole that
+        # mattered: this branch orders by size, and the largest unenriched file in the index is
+        # another student's 45,588-character Goldwater application. It would have been read
+        # first. Anything excluded is skipped rather than counted against the limit.
+        taken = 0
         for r in conn.execute(
             "SELECT id, path, title, chars FROM document WHERE id NOT IN "
             "(SELECT id FROM document WHERE " +
             " OR ".join("path LIKE ?" for _, __ in PRIORITY_PATTERNS) + ") "
-            "ORDER BY chars DESC LIMIT ?",
-            tuple(p for _, p in PRIORITY_PATTERNS) + (extra_limit,)
+            "ORDER BY chars DESC",
+            tuple(p for _, p in PRIORITY_PATTERNS)
         ):
+            if taken >= extra_limit:
+                break
+            if r["id"] in seen:
+                continue
+            why = excluded(r["path"])
+            if why:
+                skipped.append({"id": r["id"], "path": r["path"], "why": why})
+                continue
             chosen.append({"id": r["id"], "path": r["path"], "chars": r["chars"],
                            "label": "other"})
-    return chosen
+            taken += 1
+    return chosen, skipped
 
 
 def batches(docs: list[dict], budget_chars: int = 60000) -> list[list[dict]]:

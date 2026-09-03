@@ -16,7 +16,7 @@ from urllib.parse import unquote
 
 from synth.applekit import call
 
-# Tracking, unsubscribe and image-beacon links are noise in a brief.
+# Tracking, unsubscribe and image-beacon links are noise in a summary.
 NOISE = re.compile(
     r"(unsubscribe|list-manage|mailchimp|sendgrid|constantcontact|googleusercontent|"
     r"\.(png|jpe?g|gif|css|js)(\?|$)|/track/|/wf/open|utm_medium=email&?$)", re.I)
@@ -24,7 +24,8 @@ NOISE = re.compile(
 
 # Institutional mail gets rewritten by link scanners. TAMU wraps everything in Proofpoint,
 # and the result is a 200-character URL that no human can read and that hides where it
-# actually goes -- the opposite of what a brief is for. Unwrapping is pure string work.
+# actually goes -- the opposite of what handing over a link is for. Unwrapping is pure
+# string work.
 _URLDEFENSE_V3 = re.compile(r"https?://urldefense\.(?:com|proofpoint\.com)/v3/__(.+?)__;(.*?)!!")
 _SAFELINKS = re.compile(r"https?://[\w.-]*safelinks\.protection\.outlook\.com/\?url=([^&]+)")
 

@@ -71,9 +71,10 @@ binary, so the entry has to be `Synth.app/Contents/MacOS/synthkit` itself.
 
 ## 6. Turn it on
 
-    launchctl bootstrap gui/$UID ~/Library/LaunchAgents/page.akvaithi.synth.watch.plist
-    launchctl bootstrap gui/$UID ~/Library/LaunchAgents/page.akvaithi.synth.brief-morning.plist
-    launchctl bootstrap gui/$UID ~/Library/LaunchAgents/page.akvaithi.synth.brief-evening.plist
-    launchctl bootstrap gui/$UID ~/Library/LaunchAgents/page.akvaithi.synth.session.plist
+    launchctl bootstrap gui/$UID ~/Library/LaunchAgents/page.akvaithi.synth.daemon.plist
+    launchctl bootstrap gui/$UID ~/Library/LaunchAgents/page.akvaithi.synth.sync.plist
+    launchctl bootstrap gui/$UID ~/Library/LaunchAgents/page.akvaithi.synth.enrich.plist
+    launchctl bootstrap gui/$UID ~/Library/LaunchAgents/page.akvaithi.synth.connector.plist
 
-Attach to the live session with `screen -r synth`; detach with `ctrl-a d`.
+The watch and brief agents are gone: autonomy was removed on 2026-08-26 and the briefs with it.
+What is left records and never acts — see `prompts/doctrine.md`.

@@ -139,6 +139,60 @@ def migrate(conn) -> list[str]:
         done.append("action_log: added args_json")
     if done:
         conn.commit()
+
+    # Supersession keyed on the exact predicate string, so a fact rewritten under a slightly
+    # different name superseded nothing: the UIN was live three times over, the degree-audit
+    # GPA twice. facts.live() reads predicate_key instead, which is why the column has to
+    # exist and be filled before anything writes a fact.
+    from synth import predicates
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(assertion)")}
+    if "predicate_key" not in cols:
+        conn.execute("ALTER TABLE assertion ADD COLUMN predicate_key TEXT")
+        conn.commit()
+    filled = conn.execute(
+        "SELECT id, predicate FROM assertion WHERE predicate_key IS NULL").fetchall()
+    if filled:
+        conn.executemany("UPDATE assertion SET predicate_key = ? WHERE id = ?",
+                         [(predicates.key(r["predicate"]), r["id"]) for r in filled])
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_assertion_live_key "
+                     "ON assertion (entity_id, predicate_key) WHERE superseded_by IS NULL")
+        conn.commit()
+        done.append(f"assertion: added predicate_key, backfilled {len(filled)} row(s)")
+
+    # Rows that now normalise to the same predicate. Safe, idempotent, and run every time:
+    # nothing new should ever appear here, and if something does it is worth knowing.
+    collapsed = predicates.collapse_same_key(conn)
+    if collapsed:
+        log_action(conn, "dedupe_predicates", "db",
+                   f"collapsed {len(collapsed)} assertion(s) whose predicate normalises to one "
+                   f"already live on the same entity — " + "; ".join(c[:60] for c in collapsed[:8]),
+                   after={"collapsed": collapsed})
+        done.append(f"assertion: collapsed {len(collapsed)} same-key duplicate(s)")
+
+    # The duplicates already in the table. Once only -- the action_log row is the marker, and
+    # it is also the audit trail, so the merge is as visible as any other write.
+    if not conn.execute(
+        "SELECT 1 FROM action_log WHERE action = 'dedupe_predicates' LIMIT 1"
+    ).fetchone():
+        mergeable, reported = predicates.clusters(conn)
+        moved = predicates.merge(conn, mergeable)
+        named = "; ".join(
+            f"{c['keep']['predicate'][:40]} <- {len(c['supersede'])}" for c in mergeable[:8])
+        log_action(conn, "dedupe_predicates", "db",
+                   f"one-time predicate merge: {moved} assertion(s) in {len(mergeable)} "
+                   f"cluster(s) superseded onto their newest spelling; {len(reported)} "
+                   f"same-value cluster(s) left alone as too dissimilar to merge safely"
+                   + (f" — {named}" if named else ""),
+                   after={"merged": [
+                       {"entity": c["entity"], "keep": c["keep"]["predicate"],
+                        "superseded": [o["predicate"] for o in c["supersede"]]}
+                       for c in mergeable],
+                       "reported": [
+                       {"entity": r["entity"],
+                        "predicates": [m["predicate"] for m in r["members"]]}
+                       for r in reported]})
+        done.append(f"assertion: merged {moved} duplicate predicate spelling(s), "
+                    f"{len(reported)} cluster(s) reported for review")
     # run_log.status gained 'skipped'. SQLite cannot alter a CHECK constraint, so the table
     # is rebuilt -- the log is the troubleshooting record and must not be dropped.
     sql = conn.execute(

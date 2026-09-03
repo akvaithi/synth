@@ -1,6 +1,7 @@
 """synth — command line entry point.
 
     synth sync           one free sweep: documents, obligations, mail index, Notes mirror
+    synth migrate        bring the database up to the current schema
     synth ingest         read Documents, extract text, cache it
     synth index          load extracted document text into the searchable index
     synth ocr            OCR the scanned PDFs that had no text layer
@@ -14,6 +15,8 @@
     synth undo <id>      reverse one action
     synth status         health of every moving part
     synth budget [clear|reset <why>]  what it has spent, and what it may spend
+    synth dedupe-predicates [--merge <keep_id> <id>...]  one fact under several names
+    synth suspect-sources    live facts sourced from documents enrichment now excludes
 """
 from __future__ import annotations
 
@@ -147,9 +150,11 @@ def cmd_sync(args):
     except Exception as e:
         out["mail"] = f"{type(e).__name__}: {e}"
 
-    # Notes mirror. Free. The brief document is gone; these four are what remain.
+    # Notes mirror. Free. Programs is split three ways by status: rendered whole it was 88,565
+    # characters, re-composed every sweep and unreadable on a phone, which is the one thing the
+    # mirror exists for.
     notes = {}
-    for doc in ("obligations", "programs", "people", "activity"):
+    for doc in notes_sync.DOCS:
         try:
             notes[doc] = notes_sync.render(conn, doc)
         except Exception as e:
@@ -158,6 +163,101 @@ def cmd_sync(args):
 
     watcher.clear_pending()
     print(json.dumps(out, indent=2, default=str))
+    return 0
+
+
+def cmd_migrate(args):
+    """Bring the database up to the current schema. Safe to run twice."""
+    conn = db.connect()
+    steps = db.migrate(conn)
+    print("\n".join(f"  {s}" for s in steps) if steps else "  already current")
+    return 0
+
+
+def cmd_dedupe_predicates(args):
+    """One fact recorded under several predicate names.
+
+    With no arguments this reports. Supersession keys on the normalised predicate, so the
+    clusters the automatic pass could prove are already merged; what is left here needs a
+    person, because the spellings that matter most read as obviously-one-fact and score far
+    too low for a threshold that is safe to run unattended.
+    """
+    from synth import predicates
+    conn = db.connect()
+    if args and args[0] == "--merge":
+        ids = [int(a) for a in args[1:]]
+        if len(ids) < 2:
+            print("usage: synth dedupe-predicates --merge <keep_id> <id> [<id>...]",
+                  file=sys.stderr)
+            return 2
+        moved = predicates.merge_ids(conn, ids[0], ids[1:])
+        if moved:
+            db.log_action(conn, "dedupe_predicates", "db",
+                          "merged by hand: " + "; ".join(moved),
+                          target_id=str(ids[0]), after={"keep": ids[0], "superseded": ids[1:]})
+        print(f"superseded {len(moved)} assertion(s) onto {ids[0]}")
+        for m in moved:
+            print(f"  {m}")
+        return 0
+
+    mergeable, reported = predicates.clusters(conn)
+    if mergeable:
+        print(f"{len(mergeable)} cluster(s) the automatic pass has not yet taken:")
+        for c in mergeable:
+            print(f"  [{c['entity']}] keep {c['keep']['predicate']!r}")
+        print()
+    live = [r for r in reported if not r["series"]]
+    series = [r for r in reported if r["series"]]
+    print(f"{len(live)} cluster(s) share a value and need a person to judge them:\n")
+    for c in live:
+        m0 = c["members"][0]
+        val = m0["value_text"] or m0["value_date"] or m0["value_num"]
+        print(f"  [{c['entity']}]  value = {str(val)[:70]!r}")
+        for m in c["members"]:
+            print(f"      {m['id']:>6}  {m['predicate']}")
+        keep = max(c["members"], key=lambda m: (m["observed_at"], m["id"]))
+        rest = [str(m["id"]) for m in c["members"] if m["id"] != keep["id"]]
+        print(f"      -> synth dedupe-predicates --merge {keep['id']} {' '.join(rest)}\n")
+    if series:
+        print(f"{len(series)} cluster(s) share a value but are a SERIES, not duplicates — "
+              f"left alone:")
+        for c in series:
+            print(f"  [{c['entity']}] "
+                  + " | ".join(m["predicate"] for m in c["members"]))
+    return 0
+
+
+def cmd_suspect_sources(args):
+    """Live facts whose source document is one enrichment now refuses to read.
+
+    Superseded resumes were being read with today's observed_at, so an old resume entered the
+    database as the most recent evidence -- facts about the math minor and a 3.918 GPA sit at
+    confidence 1.0 alongside the corrections that replaced them. Excluding those paths stops it
+    happening again; it does not touch what is already recorded. This is the list to read
+    before deciding what to do about that, and it changes nothing by itself.
+    """
+    from synth import enrich
+    conn = db.connect()
+    rows = conn.execute(
+        "SELECT a.id, a.predicate, a.value_text, a.value_num, a.value_date, a.confidence, "
+        "  e.name AS entity, d.path FROM assertion a "
+        "JOIN entity e ON e.id = a.entity_id "
+        "JOIN source s ON s.id = a.source_id "
+        "JOIN document d ON d.source_id = s.id "
+        "WHERE a.superseded_by IS NULL ORDER BY d.path, a.predicate").fetchall()
+    hits = [(r, enrich.excluded(r["path"])) for r in rows]
+    hits = [(r, why) for r, why in hits if why]
+    print(f"{len(hits)} live fact(s) sourced from documents enrichment now excludes\n")
+    path = None
+    for r, why in hits:
+        if r["path"] != path:
+            path = r["path"]
+            print(f"  {path}\n    ({why})")
+        val = r["value_text"] or r["value_date"] or r["value_num"]
+        print(f"    {r['id']:>6}  [{r['entity']}] {r['predicate']}: {str(val)[:60]}"
+              + ("" if r["confidence"] >= 0.99 else f"  (confidence {r['confidence']:.0%})"))
+    if hits:
+        print("\nNothing was changed. These are facts, not errors — read them and decide.")
     return 0
 
 
@@ -184,8 +284,10 @@ def cmd_enrich(args):
     for a in args:
         if a.startswith("--extra="):
             extra = int(a.split("=", 1)[1])
-    docs = enrich.select(conn, extra_limit=extra)
-    print(f"{len(docs)} document(s) selected for extraction")
+    docs, skipped = enrich.select_with_skipped(conn, extra_limit=extra)
+    print(f"{len(docs)} document(s) selected for extraction, {len(skipped)} excluded")
+    for s in skipped:
+        print(f"    excluded  {s['path']}  ({s['why']})")
     results = enrich.run(conn, docs, dry_run=dry)
     print(json.dumps({"batches": len(results),
                       "errors": sum(1 for r in results if r.get("error"))}, indent=2))
@@ -309,6 +411,8 @@ COMMANDS = {
     "enrich": cmd_enrich, "notes": cmd_notes, "reconcile": cmd_reconcile,
     "call": cmd_call, "serve": cmd_serve, "log": cmd_log, "why": cmd_why,
     "undo": cmd_undo, "status": cmd_status, "budget": cmd_budget,
+    "migrate": cmd_migrate, "dedupe-predicates": cmd_dedupe_predicates,
+    "suspect-sources": cmd_suspect_sources,
 }
 
 

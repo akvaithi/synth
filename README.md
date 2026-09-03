@@ -19,7 +19,7 @@ there must not be: `ANTHROPIC_API_KEY` is explicitly stripped before every headl
         │                        │
         │  ┌─────────────────────┴───────────────┐
   launchd timers ──▶  claude -p  ──▶ MCP (stdio) │
-   watch / briefs                      │         │
+   sync / enrich                       │         │
         ▲                              ▼         ▼
         │                        synth.db   synthd (Swift, launchd)
   change watchers ───────────────────────────▶ EventKit · Mail · Notes
@@ -39,9 +39,8 @@ absence is what cost the previous system its history.
 ## Commands
 
     synth status      health of every moving part
-    synth watch       one detection pass; reacts when the debounce window closes
-    synth react       force a reaction over whatever is pending
-    synth brief       morning | evening
+    synth migrate     bring the database up to the current schema
+    synth sync        one free sweep: documents, obligations, mail index, Notes mirror
     synth index       load extracted document text into the search index
     synth ocr         OCR the scanned PDFs that had no text layer
     synth enrich      extract structured facts from the curated documents
@@ -74,9 +73,9 @@ are enforced by `.claude/hooks/guard.py`, a PreToolUse hook that blocks rather t
 | `src/synth/reactor.py` | headless `claude -p` runs |
 | `src/synth/tools.py` | the tool layer, transport-independent |
 | `src/synth/mcp_server.py` | stdio MCP (16 tools) |
-| `src/synth/http_server.py` | HTTP MCP for the connector (11 read tools) |
+| `src/synth/http_server.py` | HTTP MCP for the connector (reads and writes) |
 | `src/synth/notes_sync.py` | the two-way Notes mirror |
-| `prompts/` | doctrine, reactor, brief, enrich, interview |
+| `prompts/` | doctrine, triage, enrich, interview |
 | `launchd/` | agent plists |
 
 See `docs/architecture.md` for the measurements behind the design decisions.

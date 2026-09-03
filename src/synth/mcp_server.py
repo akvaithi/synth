@@ -1,7 +1,7 @@
 """Synth MCP server.
 
-One tool layer, two transports: stdio for the local reactor and briefs, and
-`streamable_http_app()` for the Claude app connector later. Read tools and write tools are
+One tool layer, two transports: stdio for local command-line use, and
+`streamable_http_app()` for the Claude app connector. Read tools and write tools are
 registered separately so the public transport can serve reads alone — a leaked endpoint
 should be able to embarrass, not to act.
 """
@@ -34,22 +34,43 @@ def _with_conn(fn):
 # ---------------------------------------------------------------- read tools
 
 
-def search_context(query: str, limit: int = 20) -> str:
+def search_context(query: str, limit: int = 20, include_sensitive: bool = False) -> str:
     """Search everything Synth knows — entities, facts, extracted documents and saved links.
-    Start here when answering any question about Arun."""
-    return _j(_with_conn(lambda c: tools.search_context(c, query, limit)))
+    Start here when answering any question about Arun.
+
+    Values of sensitive facts — UIN, student id, date of birth, addresses, phone, a parent's
+    name — come back withheld, with the predicate still shown. Pass include_sensitive only when
+    Arun asked for that specific value."""
+    return _j(_with_conn(lambda c: tools.search_context(c, query, limit, include_sensitive)))
 
 
-def get_entity(name: str) -> str:
-    """Everything known about one program, person, course, application, project or award:
-    current facts with provenance, related entities, obligations and links."""
-    return _j(_with_conn(lambda c: tools.get_entity(c, name)))
+def get_entity(name: str, limit: int = 60, predicate: str = "",
+               include_sensitive: bool = False) -> str:
+    """What is known about one program, person, course, application, project or award:
+    current facts with provenance, related entities, obligations and links.
+
+    **Pass `predicate` when you know what you are after.** It is a substring match over the
+    predicate name. Arun himself carries about 160 live facts, and pulling all of them to
+    answer one question about his GPA spends a large part of a context window on the other 159.
+
+    `facts_total` and `facts_shown` always come back, so a bounded answer is never mistakable
+    for a complete one — if they differ, say so rather than implying you saw everything.
+
+    Sensitive values are withheld by default with the predicate still listed. Pass
+    include_sensitive=true only when Arun asked for that value."""
+    return _j(_with_conn(lambda c: tools.get_entity(c, name, limit, predicate,
+                                                    include_sensitive)))
 
 
-def fact_history(name: str, predicate: str) -> str:
+def fact_history(name: str, predicate: str, include_sensitive: bool = False) -> str:
     """Every value a fact has held over time, newest first, with what told us and when.
-    Use when a date or requirement may have changed."""
-    return _j(_with_conn(lambda c: tools.fact_history(c, name, predicate)))
+    Use when a date or requirement may have changed.
+
+    The predicate is matched on a normalised form, so small differences in wording still find
+    it. If it genuinely is not there you get the entity's real predicate names back in
+    `did_you_mean` and `available_predicates` — an empty `history` with an `error` means the
+    NAME was wrong, not that the value never changed."""
+    return _j(_with_conn(lambda c: tools.fact_history(c, name, predicate, include_sensitive)))
 
 
 def list_obligations(status: str = "open", limit: int = 100) -> str:
@@ -73,7 +94,11 @@ def read_document(doc_id: int = 0, path: str = "", max_chars: int = 20000) -> st
 
 
 def today() -> str:
-    """Calendar events for the next day and all open reminders, live from EventKit."""
+    """Events for the next 24 HOURS and every open reminder, live from EventKit.
+
+    Despite the name this is a rolling window, not a calendar day: late in the evening it
+    returns tomorrow's events and nothing from today. The `window` field says exactly what it
+    covered — quote that rather than calling it "today". For a named day, use agenda."""
     return _j(_with_conn(lambda c: tools.today(c)))
 
 
@@ -129,7 +154,14 @@ def add_facts(payload: dict, source_ref: str = "interview", document_id: int = 0
 
     When extracting from a document, ALWAYS pass document_id — the id you were given for
     that document. It links every fact back to the file that stated it, which is what makes
-    provenance answerable later. One add_facts call per document."""
+    provenance answerable later. One add_facts call per document.
+
+    **Reuse an existing predicate name exactly when you mean the same fact.** Supersession
+    matches on the predicate, so "cumulative GPA" and "cumulative GPA as stated on the master
+    resume" are two facts that both stay live for ever rather than one that was corrected. If
+    the result comes back with `near_duplicates`, that has just happened: write the fact again
+    under the existing name to supersede properly, or tell Arun why they are genuinely
+    different."""
     return _j(_with_conn(lambda c: tools.add_facts(
         c, payload, source_ref=source_ref, document_id=document_id or None)))
 
@@ -155,8 +187,14 @@ def create_reminder(title: str, reason: str, due: str = "", list: str = "",
     within its own list instead. Either way, do nothing unless it is genuinely separate, then
     pass force and say why in the reason.
 
+    `due` takes a bare local datetime (2026-09-02T09:00:00) or one with an offset.
+
     On success the result may carry `time_conflicts`: something sharing the hour but nothing
     in its name. That is a note to pass on, not a reason the write should not have happened.
+
+    If it carries `duplicate_check_failed`, the duplicate check could not run and the reminder
+    was created UNCHECKED. Say so plainly and check the day with agenda before creating
+    anything else near that time.
 
     Filing several things onto one list? Use create_reminders."""
     return _j(_with_conn(lambda c: tools.create_reminder(
@@ -185,8 +223,8 @@ def create_reminders(titles: list[str], reason: str, list: str = "", due: str = 
 def complete_reminder(ek_identifier: str, reason: str, evidence_source: str = "") -> str:
     """Mark a reminder complete. Completion, never deletion.
 
-    Pass evidence_source with the Message-ID when mail is what resolved it, so the next brief
-    can show what closed it and link back to the evidence."""
+    Pass evidence_source with the Message-ID when mail is what resolved it, so `why` can show
+    what closed it and link back to the evidence."""
     return _j(_with_conn(lambda c: tools.complete_reminder(
         c, ek_identifier=ek_identifier, reason=reason,
         evidence_source=evidence_source or None)))
@@ -208,7 +246,10 @@ def create_event(title: str, start: str, reason: str, end: str = "",
     commitment, and say why in the reason.
 
     `reason` is required and recorded. The event is created even when it overlaps something
-    else, but the overlap comes back in `conflicts` — report it to Arun."""
+    else, but the overlap comes back in `conflicts` — report it to Arun.
+
+    `duplicate_check_failed` means the already-scheduled check could not run and this was
+    created unchecked. There is no way to delete an event, so tell Arun immediately."""
     return _j(_with_conn(lambda c: tools.create_event(
         c, title=title, start=start, reason=reason, end=end or None,
         calendar=calendar or None, location=location or None, notes=notes or None,
@@ -259,12 +300,18 @@ def already_scheduled(title: str, when: str, window_minutes: int = 240) -> str:
     eight events almost any proposed time is within half an hour of something, and treating
     that as a duplicate makes a busy day unwritable.
 
+    `when` takes either a bare local datetime (2026-09-02T09:00:00) or one carrying an offset
+    (2026-09-02T09:00:00-05:00). A bare one is read as Arun's zone and the response says so in
+    `assumed_timezone`.
+
     Keywords: duplicate, conflict, clash, overlap, is this already scheduled."""
     return _j(_with_conn(lambda c: tools.already_scheduled(c, title, when, window_minutes)))
 
 
 def conflicts(start: str, minutes: int = 30) -> str:
-    """What overlaps a proposed time. Never schedule a reminder on top of a class."""
+    """What overlaps a proposed time. Never schedule a reminder on top of a class.
+
+    `start` takes a bare local datetime or one with an offset; bare is read as Arun's zone."""
     return _j(_with_conn(lambda c: tools.conflicts(c, start, minutes)))
 
 
@@ -307,8 +354,9 @@ def retract_reminder(ek_identifier: str, reason: str) -> str:
 def read_note(doc: str = "", note_id: str = "", folder: str = "", name: str = "") -> str:
     """Read a note's current text.
 
-    `doc` reads one of the mirrored documents — brief, obligations, programs, people,
-    activity — which is how corrections Arun types into the Synth folder reach you. `note_id`
+    `doc` reads one of the mirrored documents — obligations, programs_active,
+    programs_submitted, programs_closed, people, activity — which is how corrections Arun
+    types into the Synth folder reach you. `note_id`
     reads one you already have an id for. `folder` with `name` reads any other note; find the
     name with list_notes."""
     return _j(_with_conn(lambda c: tools.read_note(c, doc, note_id, folder, name)))
@@ -328,9 +376,8 @@ def create_note(name: str, body: str, reason: str, folder: str = "Notes") -> str
     with the real folders named. The "Synth" folder is the database mirror and is refused: its
     notes are re-rendered, so anything written there is overwritten or blocks the mirror.
 
-    `body` takes '#' headings, '- ' bullets and blank-line-separated paragraphs, rendered the
-    way a brief is. Refused if a note of that name is already in the folder — append to that
-    one instead.
+    `body` takes '#' headings, '- ' bullets and blank-line-separated paragraphs. Refused if a
+    note of that name is already in the folder — append to that one instead.
 
     `reason` is required and recorded. Synth never deletes: a note it created has to be
     removed by Arun himself, so be correspondingly deliberate."""
@@ -401,8 +448,8 @@ def update_document(path: str, old: str, new: str, reason: str) -> str:
     """Replace one exact passage in one of Arun's markdown files. This writes the FILE, on
     disk, in iCloud — it syncs to his phone. It is a real edit, not a database note.
 
-    Only Archive/Synth/markdown/ is writable. Inside it, self.md, corrections.md,
-    patterns.md, CLAUDE.md and CONTEXT.md are read-only.
+    Only Archive/Synth/markdown/ is writable, and only .md, .markdown and .txt. Inside it,
+    CLAUDE.md and CONTEXT.md are read-only: they are what Synth is told about itself.
 
     `old` is the exact text to replace and MUST appear exactly once. Copy it verbatim from
     read_document, including line breaks and punctuation. Zero matches and two matches are
