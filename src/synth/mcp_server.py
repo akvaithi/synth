@@ -34,14 +34,25 @@ def _with_conn(fn):
 # ---------------------------------------------------------------- read tools
 
 
-def search_context(query: str, limit: int = 20, include_sensitive: bool = False) -> str:
+def search_context(query: str, limit: int = 20, include_sensitive: bool = False,
+                   mode: str = "hybrid") -> str:
     """Search everything Synth knows — entities, facts, extracted documents and saved links.
     Start here when answering any question about Arun.
+
+    Documents are ranked two ways at once and the results fused. Keyword search finds an exact
+    identifier, a course number or a name; embedding search finds a document that is ABOUT
+    what you asked even when it shares no words with the question. Each document says which
+    found it in `found_by`: "text", "meaning" or "both". Ask in a full sentence rather than in
+    keywords — the meaning half is what that helps, and the keyword half is unharmed by it.
+
+    Pass mode="text" to disable the meaning half. The `semantic` key says what happened; if
+    local inference is unreachable it says so and the keyword results are unaffected.
 
     Values of sensitive facts — UIN, student id, date of birth, addresses, phone, a parent's
     name — come back withheld, with the predicate still shown. Pass include_sensitive only when
     Arun asked for that specific value."""
-    return _j(_with_conn(lambda c: tools.search_context(c, query, limit, include_sensitive)))
+    return _j(_with_conn(lambda c: tools.search_context(c, query, limit, include_sensitive,
+                                                        mode)))
 
 
 def get_entity(name: str, limit: int = 60, predicate: str = "",
@@ -566,6 +577,45 @@ def undo(action_id: int) -> str:
     return _j(_with_conn(lambda c: tools.undo(c, action_id)))
 
 
+def delete_reminder(ek_identifier: str, reason: str) -> str:
+    """Remove any reminder, including one Arun made himself.
+
+    **Undo recreates this; it does not restore it.** EventKit issues a new identifier on save,
+    so anything referring to the old one no longer follows it.
+
+    Prefer `complete_reminder` when the thing is finished rather than unwanted — completion
+    keeps the history, and this does not. Use `retract_reminder` instead when the reminder is
+    one Synth created by mistake; it proves that from the action log."""
+    return _j(_with_conn(lambda c: tools.delete_reminder(c, ek_identifier, reason)))
+
+
+def delete_event(event_id: str, reason: str) -> str:
+    """Remove a calendar event, this occurrence only.
+
+    **Undo recreates this; it does not restore it.** Be correspondingly slower to remove one
+    than to move it — `update_event` can change the time, the title or the place, and undo
+    puts those back exactly."""
+    return _j(_with_conn(lambda c: tools.delete_event(c, event_id, reason)))
+
+
+def delete_note(note_id: str, reason: str) -> str:
+    """Move a note to Recently Deleted, where Notes keeps it for thirty days and Arun can
+    restore it from the app himself.
+
+    Refuses the notes in the `Synth` mirror folder: those are rendered from the database, so
+    deleting one removes a rendering rather than a fact and the next sweep writes it back."""
+    return _j(_with_conn(lambda c: tools.delete_note(c, note_id, reason)))
+
+
+def delete_document(path: str, reason: str) -> str:
+    """Delete a file in the writable documents folder.
+
+    The one delete that is **genuinely reversible**: the previous bytes are kept and undo puts
+    the file back at the same path, byte for byte. The usual containment rules apply, so
+    `CLAUDE.md`, `CONTEXT.md` and anything outside the writable folder are refused."""
+    return _j(_with_conn(lambda c: tools.delete_document(c, path, reason)))
+
+
 READ_TOOLS = [search_context, get_entity, fact_history, list_obligations, read_document,
               today, activity, why, mail_digest, mail_recent, mail_read, mail_attachments,
               read_attachment, mail_links, read_note, list_notes, agenda, already_scheduled,
@@ -576,13 +626,16 @@ WRITE_TOOLS = [add_facts, create_reminder, create_reminders, complete_reminder,
                create_note, append_note,
                update_document, append_document, create_document,
                reindex_documents, enrich_documents, undo]
+# Offered only to a session Arun is driving. See registry.DELETE for why this is a third set
+# and not four more entries in WRITE.
+DELETE_TOOLS = [delete_reminder, delete_event, delete_note, delete_document]
 
 
 DOCTRINE_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__)))), "prompts", "doctrine.md")
 
 
-def _instructions(writable: bool) -> str:
+def _instructions(caps) -> str:
     """Ship the operating doctrine with the server.
 
     The reactor gets these rules in its prompt; a client reaching in over MCP would not,
@@ -605,17 +658,53 @@ def _instructions(writable: bool) -> str:
         if not skipping:
             out.append(line)
     body = "\n".join(out)
-    if not writable:
+    # Say what this particular connection can actually do. A server that ships the full
+    # doctrine while offering half the tools invites promises it cannot keep.
+    if "write" not in caps:
         body += ("\n\n## This connection is read-only\n\n"
                  "Only the read tools are available here. Do not promise to create, change "
                  "or draft anything.")
+    elif "delete" in caps:
+        body += ("\n\n## Deleting, on this connection\n\n"
+                 "Arun is driving this session, so `delete_reminder`, `delete_event`, "
+                 "`delete_note` and `delete_document` are available. They are for when he "
+                 "asks. Never remove something because it looks stale, duplicated or wrong to "
+                 "you — say what you found and let him decide.\n\n"
+                 "Only `delete_document` truly reverses: the bytes are kept and undo puts the "
+                 "file back at the same path. Reminders, events and notes are reissued with a "
+                 "NEW identifier, so an undone delete is a copy and anything referring to the "
+                 "old one no longer follows it. Say that plainly before removing one, and "
+                 "prefer `complete_reminder` when the thing is finished rather than unwanted.")
     return body
 
 
-def build(name: str = "synth", writable: bool = True) -> MCPServer:
-    server = MCPServer(name, instructions=_instructions(writable))
-    for fn in READ_TOOLS + (WRITE_TOOLS if writable else []):
-        server.add_tool(fn)
+# Ordered weakest to strongest; each tier includes the ones before it.
+CAPABILITIES = {"read": READ_TOOLS, "write": WRITE_TOOLS, "delete": DELETE_TOOLS}
+FULL = ("read", "write", "delete")
+
+
+def build(name: str = "synth", caps=FULL, writable: bool | None = None) -> MCPServer:
+    """An MCP server offering exactly the tiers named.
+
+    `caps` replaces the old two-state `writable` flag, which could only say "reads" or
+    "everything" and so had nowhere to put a delete. The default is everything, because both
+    callers of this are sessions Arun is driving himself -- the stdio server he runs and the
+    connector he reaches from the Claude app. Autonomy is the case that gets a narrowed set,
+    and it does not come through here at all.
+
+    `writable` is still accepted so an existing caller keeps working, and means what it always
+    meant: reads only, or reads and writes. It never grants delete.
+    """
+    if writable is not None:
+        caps = ("read", "write") if writable else ("read",)
+    unknown = set(caps) - set(CAPABILITIES)
+    if unknown:
+        raise ValueError(f"unknown capability {sorted(unknown)}; have {sorted(CAPABILITIES)}")
+    server = MCPServer(name, instructions=_instructions(caps))
+    for tier in CAPABILITIES:
+        if tier in caps:
+            for fn in CAPABILITIES[tier]:
+                server.add_tool(fn)
     return server
 
 

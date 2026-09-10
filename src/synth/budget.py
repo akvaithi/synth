@@ -223,7 +223,13 @@ def note_failure(result: dict) -> dict | None:
 # the two jobs left, triage is the chatty one -- it fires whenever mail arrives -- while
 # enrichment runs once a night and is what actually builds the context. Without a reserve a
 # noisy inbox could spend the day's ceiling before 03:00 and starve it.
-PRIORITY = {"enrich": 0, "urgent": 1, "triage": 2}
+# Lower is more protected: only priority 0 may spend into the reserve. `brief` was missing
+# here and so scored PRIORITY.get(job, 3) -- the *lowest* priority of any job, while the
+# docstring below said the reserve existed precisely so a heavy afternoon could not starve
+# the morning brief. The data contradicted the rule it was meant to implement. It matters
+# more now than it did: background reasoning runs on local models and costs nothing, so the
+# brief is the only job that still spends money at all.
+PRIORITY = {"brief": 0, "enrich": 1, "urgent": 2, "triage": 3}
 
 
 def allowed(conn, job: str) -> tuple[bool, str]:
@@ -254,7 +260,7 @@ def allowed(conn, job: str) -> tuple[bool, str]:
     ):
         limit = ceiling if protected else ceiling - held
         if spent >= limit:
-            note = "" if protected else f" (${held:.2f} of it is reserved for enrichment)"
+            note = "" if protected else f" (${held:.2f} of it is reserved for the brief)"
             return False, (f"{label} spend ${spent:.2f} has reached "
                            f"${limit:.2f}{note}")
     return True, ""

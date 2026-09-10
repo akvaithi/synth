@@ -104,6 +104,21 @@ def migrate(conn) -> list[str]:
     must be safe to run twice.
     """
     done = []
+    # Every statement in schema.sql is CREATE ... IF NOT EXISTS, so replaying the whole file
+    # is safe and is what brings a NEW table into an existing database. Without this, a new
+    # table had to be written twice -- once in schema.sql for a fresh install and once here
+    # for the live one -- and the two definitions drift, which is the failure this avoids.
+    # Only ALTERs to existing tables need their own step below.
+    before = {r["name"] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table'")}
+    with open(SCHEMA_PATH) as f:
+        conn.executescript(f.read())
+    conn.commit()
+    added = {r["name"] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table'")} - before
+    if added:
+        done.append(f"created {', '.join(sorted(added))}")
+
     # A run killed mid-flight leaves its row saying 'running' forever, which makes `status`
     # and the ledger both lie. Anything still marked running from a previous process is over.
     stale = conn.execute(
@@ -377,6 +392,24 @@ REVERSALS = {
     "notes_update": ("notes_update", lambda before: {
         "id": before["id"], "body": before["body"],
     }),
+    # Deletes are reversed by building the thing again, which is not the same as putting it
+    # back: EventKit and Notes both issue a new identifier on save, so anything that referred
+    # to the old one no longer resolves. The tools say so in as many words rather than letting
+    # the existence of an undo imply more than it does.
+    "delete_reminder": ("create_reminder", lambda before: {
+        "title": before["title"], "list": before.get("list"),
+        "notes": before.get("notes"),
+        **({"due": before["due"], "hasTime": before.get("hasTime", True)}
+           if before.get("due") else {}),
+    }),
+    "delete_event": ("create_event", lambda before: {
+        "title": before["title"], "start": before["start"], "end": before.get("end"),
+        "calendar": before.get("calendar"), "location": before.get("location"),
+        "notes": before.get("notes"), "allDay": before.get("allDay", False),
+    }),
+    "delete_note": ("notes_create", lambda before: {
+        "name": before.get("name"), "body": before.get("body", ""),
+    }),
 }
 
 
@@ -395,11 +428,22 @@ def _restore_document(conn, before):
 PY_REVERSALS = {
     "update_document": _restore_document,
     "append_document": _restore_document,
+    # The one delete that genuinely restores rather than recreates: the bytes are in
+    # .state/docversions and the path does not change, so undoing it is indistinguishable
+    # from the file never having been deleted.
+    "delete_document": _restore_document,
 }
 
 
 def undo(conn, action_id: int) -> str:
-    """Reverse one logged action. Creations are not reversed — Synth never deletes."""
+    """Reverse one logged action.
+
+    A creation is still not reversed here, and that is now a choice rather than a limitation:
+    delete_reminder, delete_event and delete_note exist for the tier Arun drives directly. But
+    they are separate acts that he asks for by name. Turning `undo` into a delete would mean a
+    single call could remove something of his as a side effect of tidying, and for two of the
+    three that removal cannot be taken back the way an edit can.
+    """
     from synth.applekit import call
 
     row = conn.execute(
@@ -418,8 +462,13 @@ def undo(conn, action_id: int) -> str:
         return f"reversed action {action_id}: {detail}"
     if row["action"] not in REVERSALS:
         if row["action"].startswith("create_"):
-            return (f"action {action_id} created a {row['target_kind']}; Synth never deletes. "
-                    f"Remove it by hand if you want it gone: {row['target_id']}")
+            tool = {"reminder": "delete_reminder", "event": "delete_event",
+                    "note": "delete_note", "document": "delete_document"
+                    }.get(row["target_kind"])
+            how = (f"Use {tool} if you want it gone" if tool
+                   else "Remove it by hand if you want it gone")
+            return (f"action {action_id} created a {row['target_kind']}, and undo does not "
+                    f"delete. {how}: {row['target_id']}")
         return f"action {action_id} ({row['action']}) has no defined reversal"
     if not row["before_json"]:
         return f"action {action_id} has no recorded prior state, so it cannot be reversed"

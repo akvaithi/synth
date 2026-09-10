@@ -271,15 +271,19 @@ def reconcile(conn) -> dict:
     return out
 
 
-def live_hashes() -> dict[str, str]:
-    """Hash every note in the mirror folder, read through notes_dump.
+def live_hashes(folder: str | None = None) -> dict[str, str]:
+    """Hash every note in a folder, read through notes_dump.
 
     notes_get and notes_dump return subtly different HTML for the same note, so hashing one
     and comparing against the other marks every note as edited. The watcher uses dump, so
     dump is the single source of truth for hashing.
+
+    Defaults to the mirror folder, which is what every existing caller wants. The parameter
+    exists for notes Synth writes elsewhere -- a brief is in its own folder and still has to
+    be hashed the same way, or the watcher reads it back as an edit of Arun's.
     """
     return {n["id"]: db.text_hash(n["body"])
-            for n in call("notes_dump", folder=config.NOTES_FOLDER, timeout=300)}
+            for n in call("notes_dump", folder=folder or config.NOTES_FOLDER, timeout=300)}
 
 
 def pending_corrections(conn) -> list[dict]:
@@ -345,6 +349,51 @@ def render(conn, doc: str, run_id=None, force: bool = False) -> str:
     )
     conn.commit()
     return "written"
+
+
+def record_write(conn, note_id: str, folder: str, name: str, purpose: str = "note",
+                 action_id: int | None = None) -> str | None:
+    """Remember what Notes stored after Synth wrote a note, so the watcher knows it was us.
+
+    notes_mirror does this for the six rendered documents. Everything ELSE Synth writes --
+    create_note, append_note, and now the brief -- is invisible to that bookkeeping, so
+    poll_notes sees a note whose live hash matches nothing it wrote and reports a correction
+    from Arun that nobody made. A phantom correction holds the mirror and files an edit
+    against a note he never touched.
+
+    The hash is of what Notes RETURNED after the write, never of what was composed. Notes
+    rewrites HTML on save, so the two are never equal -- that difference is the whole reason
+    render() reads back rather than trusting what it sent, and it applies identically here.
+
+    Returns the stored hash, or None if Notes could not be read back; a failure here must not
+    fail the write that already happened.
+    """
+    try:
+        stored = live_hashes(folder=folder).get(note_id)
+    except Exception:
+        return None
+    if stored is None:
+        return None
+    conn.execute(
+        "INSERT INTO synth_note (note_id, folder, name, written_hash, action_id, purpose) "
+        "VALUES (?,?,?,?,?,?) ON CONFLICT (note_id) DO UPDATE SET "
+        "folder=excluded.folder, name=excluded.name, written_hash=excluded.written_hash, "
+        "written_at=datetime('now'), action_id=excluded.action_id, purpose=excluded.purpose",
+        (note_id, folder, name, stored, action_id, purpose))
+    conn.commit()
+    return stored
+
+
+def written_by_synth(conn, note_id: str, live_hash: str) -> bool:
+    """Is this note's current content exactly what Synth last wrote to it?
+
+    A content check rather than a timestamp: correct however long iCloud took to settle, and
+    it stops being true the moment Arun actually edits the note, which is exactly when the
+    watcher should start caring again.
+    """
+    row = conn.execute("SELECT written_hash FROM synth_note WHERE note_id = ?",
+                       (note_id,)).fetchone()
+    return row is not None and row["written_hash"] == live_hash
 
 
 def sync_all(conn, run_id=None) -> dict:

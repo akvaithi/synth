@@ -331,6 +331,34 @@ def unreported(conn, limit: int = 80) -> list[dict]:
         (limit,))]
 
 
+def resolve_indexes(accounts, limit_factor: int = 2) -> dict[str, dict[str, int]]:
+    """Current mailbox index for every recent Message-ID, per account.
+
+    A mailbox index moves every time mail arrives, so one recorded when a message was filed
+    is stale by the time anything acts on it. The daemon verifies the Message-ID and refuses
+    a mismatch, so a stale index is safe rather than wrong -- it returns nothing, which is
+    the quiet failure that leaves an answer linkless for no visible reason.
+
+    One enumeration per account, shared by every caller that needs it. Reading bodies message
+    by message would otherwise pay that cost once each: it is well over a minute across four
+    accounts, which is the whole reason mail_probe exists to gate it.
+    """
+    from synth.applekit import call
+
+    out: dict[str, dict[str, int]] = {}
+    for account in {a for a in accounts if a}:
+        try:
+            out[account] = {m["messageId"]: m["index"]
+                            for m in call("mail_recent", account=account,
+                                          limit=config.MAIL_SCAN_LIMIT * limit_factor,
+                                          timeout=300)
+                            if m.get("messageId")}
+        except Exception:
+            # One unreachable account must not cost the others their indexes.
+            out[account] = {}
+    return out
+
+
 def fill_links(conn, rows: list[dict], cap: int = 12) -> None:
     """Pull destination URLs out of filtered mail without spending a token.
 
@@ -338,26 +366,15 @@ def fill_links(conn, rows: list[dict], cap: int = 12) -> None:
     fetch them cost a whole brief: it spent thirty-one turns calling mail_links per message,
     hit its turn limit and produced nothing at all. Parsing HTML is Python's job.
 
-    Indexes are resolved fresh rather than trusted from when the message was filed, because
-    a mailbox index moves every time mail arrives. The daemon verifies the Message-ID and
-    refuses a mismatch, so a stale index is safe -- it simply returns nothing, which is the
-    quiet failure that leaves an answer linkless for no visible reason.
+    Indexes are resolved fresh through resolve_indexes rather than trusted from when the
+    message was filed; see there for why.
     """
     from synth import maillinks
-    from synth.applekit import call
 
     want = [r for r in rows if r.get("links") is None and r["verdict"] == "digest"][:cap]
     if not want:
         return
-    index: dict[str, dict[str, int]] = {}
-    for account in {r["account"] for r in want if r["account"]}:
-        try:
-            index[account] = {m["messageId"]: m["index"]
-                              for m in call("mail_recent", account=account,
-                                            limit=config.MAIL_SCAN_LIMIT * 2, timeout=300)
-                              if m.get("messageId")}
-        except Exception:
-            index[account] = {}
+    index = resolve_indexes({r["account"] for r in want})
     for r in want:
         i = index.get(r["account"], {}).get(r["message_id"]) or r.get("mail_index")
         urls = []

@@ -10,16 +10,18 @@ is recorded with a verdict and the reasoning behind it, so when he asks "anythin
 answer is already sorted rather than assembled on the spot. What used to be promoted to a full
 run is now simply marked urgent and left for him.
 
-Cost: the static tier is free. The Haiku tier sees subject lines only, no tools, no thinking,
-and only for messages the static rules could not settle -- measured at about five cents a
-batch, against roughly thirty for one run of the tier that is gone.
+Cost: nothing, in the ordinary case. The static tier is free and settles most of it. What it
+cannot settle goes to a model on Arun's own network, which is also free. Metered Haiku is now
+only the escalation for local output that cannot be read at all, and the free static rules are
+the floor beneath that -- so three things have to fail before a message is sorted badly, and
+none of them can drop it.
 """
 from __future__ import annotations
 
 import json
 import re
 
-from synth import db, runner, triage as tri
+from synth import db, ollama, runner, triage as tri
 
 
 def _obligation_lines(conn, limit: int = 25) -> str:
@@ -39,6 +41,12 @@ def _message_table(messages: list[dict]) -> str:
         f"  subject: {m.get('subject','')}\n"
         f"  received: {m.get('receivedAt','')}  account: {m.get('account','')}"
         for m in messages)
+
+
+# The free classifier's four verdicts mapped onto the three the model returns, for when the
+# model's answer cannot be read. `consider` is what the static rules say when they recognise
+# nothing either way, and that is the case that has to stay visible -- so it maps to `act`.
+STATIC_TO_VERDICT = {"urgent": "act", "consider": "act", "digest": "digest", "ignore": "digest"}
 
 
 def _extract_verdicts(text: str) -> dict:
@@ -71,23 +79,87 @@ def _extract_verdicts(text: str) -> dict:
     return out
 
 
+# Subject-line triage as a schema, so the answer cannot arrive as prose that has to be found.
+# The old path scraped braces out of whatever Haiku wrapped its answer in; a constrained
+# decode makes that the fallback rather than the mechanism.
+TRIAGE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "verdicts": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "messageId": {"type": "string"},
+                    "verdict": {"type": "string", "enum": ["act", "digest", "ignore"]},
+                    "why": {"type": "string"},
+                },
+                "required": ["messageId", "verdict"],
+            },
+        },
+    },
+    "required": ["verdicts"],
+}
+
+
 def triage_batch(conn, messages: list[dict]) -> dict:
-    """Subject lines only, cheapest model, no tools, no thinking budget."""
+    """Subject lines only. Local first, metered Claude only if local cannot answer.
+
+    This was the last recurring thing Synth paid for besides the brief, at about five cents a
+    batch -- which was cheap until the brief came back at three dollars a run and the daily
+    ceiling started refusing triage to protect it. Sorting subject lines is exactly what an 8B
+    model on Arun's own network is for, and moving it here means the whole budget belongs to
+    the one job that actually needs a metered model.
+
+    Escalation is mechanical, never a judgement: local output that cannot be read, or local
+    inference that is not there at all. A local run that answers is trusted.
+    """
     prompt = runner.prompt("triage", core_only=True,
                            messages=_message_table(messages),
                            obligations=_obligation_lines(conn))
-    result = runner.spend(conn, "triage", f"triage: {len(messages)} subject(s)",
-                          prompt, runner.NO_TOOLS, model=runner.TRIAGE_MODEL,
-                          max_turns=4, thinking=0, denied=runner.DENY_ALL)
-    if result.get("skipped") or result.get("is_error"):
-        return {"verdicts": {}, "result": result}
-    verdicts = _extract_verdicts(str(result.get("result", "")))
+    result: dict = {}
+    verdicts: dict = {}
+    try:
+        answer = ollama.generate_json(prompt, TRIAGE_SCHEMA, tier="fast")
+        for v in answer.get("verdicts", []):
+            if isinstance(v, dict) and v.get("messageId"):
+                verdicts[v["messageId"]] = (v.get("verdict", "digest"), v.get("why", ""))
+        result = {"source": "local", "count": len(verdicts)}
+    except ollama.OllamaError as e:
+        result = {"source": "local", "error": f"{type(e).__name__}: {e}"}
+
     if not verdicts:
-        # Unparseable output must not silently drop mail. Mark the batch worth a look rather
-        # than assuming it was noise.
-        return {"verdicts": {m.get("messageId"): ("act", "triage output unreadable")
-                             for m in messages},
-                "result": result, "degraded": True}
+        # Local could not answer. This is one of the two mechanical escalation triggers, and
+        # it is still budget-gated -- a broken tunnel must not be able to spend the month.
+        result = runner.spend(conn, "triage", f"triage: {len(messages)} subject(s)",
+                              prompt, runner.NO_TOOLS, model=runner.TRIAGE_MODEL,
+                              max_turns=4, thinking=0, denied=runner.DENY_ALL)
+        if result.get("skipped") or result.get("is_error"):
+            return {"verdicts": {}, "result": result}
+        verdicts = _extract_verdicts(str(result.get("result", "")))
+    if not verdicts:
+        # Unparseable output must not silently drop mail -- but it must not cry wolf either.
+        # This used to mark every message in the batch "act", so one unreadable reply turned
+        # a quiet inbox into a full one. Fall back to the free tier instead: static rules and
+        # learned sender policy already settle most mail for nothing, and they are a strictly
+        # better guess than a blanket flag. Anything they cannot settle still comes back
+        # `consider`, so nothing is dropped and the noise is bounded by what is genuinely
+        # unrecognised. `degraded` stays set: the caller records that this batch was not
+        # actually judged by a model.
+        ctx = tri.context(conn)
+        fallback = {}
+        for m in messages:
+            if not m.get("messageId"):
+                continue
+            try:
+                verdict = tri.classify(m, ctx)[0]
+            except Exception:
+                # A classifier that cannot judge is not a reason to hide a message.
+                verdict = "consider"
+            fallback[m["messageId"]] = (
+                STATIC_TO_VERDICT.get(verdict, "act"),
+                "triage output unreadable; sorted by static rules instead")
+        return {"verdicts": fallback, "result": result, "degraded": True}
     return {"verdicts": verdicts, "result": result}
 
 

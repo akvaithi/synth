@@ -9,9 +9,11 @@ MAIL_ACCOUNTS = {
     "iCloud": "akvaithi.msg@icloud.com",
 }
 
-# Reaction latency. Detection is free (no model calls); only a run that has something to
-# chew on costs quota, so this can be short.
-DEBOUNCE_SECONDS = 120
+# Reaction latency. Both of these were sized when a reactor run cost about thirty cents on
+# Sonnet, so batching mail for half an hour was how a burst of newsletters avoided paying for
+# itself one message at a time. Background reasoning is local and free now, so the only thing
+# a window still buys is collapsing a burst into one run -- which needs seconds, not minutes.
+DEBOUNCE_SECONDS = int(_os.environ.get("SYNTH_DEBOUNCE", "15"))
 
 # The Notes folder that mirrors the context DB, and is read back for corrections.
 NOTES_FOLDER = "Synth"
@@ -131,20 +133,28 @@ def _money(name: str, default: float) -> float:
 # $0.30-0.80 on an ordinary day against the $1.50-1.80 of the reactor era and the $8-14 before
 # that. These ceilings are a circuit breaker, not a throttle: they should never be reached in
 # normal use, and reaching one means something is wrong rather than busy.
-BUDGET_5H = _money("SYNTH_BUDGET_5H", 1.50)
+# Sized on 2026-08-30, when the only metered job was five-cent triage batches and the brief
+# did not exist. The brief came back on 2026-09-10 and the first researched one cost $2.99 in
+# 46 turns -- twice the whole 5-hour ceiling on its own, which then refused everything else
+# for the rest of the day to protect a reserve it had already spent.
+#
+# Two morning briefs and two evening ones is the realistic worst case, and the evening brief
+# is much cheaper: no web tools, 18 turns instead of 45. Everything else Synth does now runs
+# on local inference and costs nothing, so this ceiling is the brief's alone.
+BUDGET_5H = _money("SYNTH_BUDGET_5H", 4.00)
 # Held back from everything except enrichment, so a noisy inbox cannot spend the ceiling on
 # five-cent triage batches before the 03:00 enrichment run and leave it nothing. Triage is
 # chatty and cheap; enrichment is rare and is what actually builds the context.
-BUDGET_5H_RESERVE = _money("SYNTH_BUDGET_5H_RESERVE", 0.50)
-BUDGET_DAY_RESERVE = _money("SYNTH_BUDGET_DAY_RESERVE", 1.00)
+BUDGET_5H_RESERVE = _money("SYNTH_BUDGET_5H_RESERVE", 1.50)
+BUDGET_DAY_RESERVE = _money("SYNTH_BUDGET_DAY_RESERVE", 3.00)
 BUDGET_MONTH_RESERVE = _money("SYNTH_BUDGET_MONTH_RESERVE", 5.00)
-BUDGET_DAY = _money("SYNTH_BUDGET_DAY", 3.00)
-BUDGET_MONTH = _money("SYNTH_BUDGET_MONTH", 30.00)
+BUDGET_DAY = _money("SYNTH_BUDGET_DAY", 8.00)
+BUDGET_MONTH = _money("SYNTH_BUDGET_MONTH", 60.00)
 
 # Ordinary mail waits this long so a batch is judged in one run instead of one run per
 # message. The log was full of "mail: 1 event(s)" runs costing $0.30 to read a newsletter;
 # a batch of twelve costs barely more than a batch of one. Urgent mail bypasses this.
-MAIL_BATCH_SECONDS = int(_os.environ.get("SYNTH_MAIL_BATCH", "1800"))
+MAIL_BATCH_SECONDS = int(_os.environ.get("SYNTH_MAIL_BATCH", "120"))
 
 # A sender seen this many times without ever producing an action is demoted to digest:
 # recorded in the mail index, never given a model run.

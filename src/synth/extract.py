@@ -15,6 +15,7 @@ Three engines, each where it is strongest:
 """
 from __future__ import annotations
 
+import contextlib
 import os
 import subprocess
 import unicodedata
@@ -91,17 +92,45 @@ def _docx_xml(path: str) -> str:
     return "\n".join(paras)
 
 
+@contextlib.contextmanager
+def _quiet_stderr():
+    """Silence CoreGraphics' PDF complaints for the length of one parse.
+
+    A malformed PDF makes CoreGraphics write "CoreGraphics PDF has logged an error. Set
+    environment variable CG_PDF_VERBOSE to learn more." straight to file descriptor 2. It is
+    not actionable, PDFKit still returns usable text, and there is one per bad file: .state/
+    sync.err.log was 236 lines and every single one of them was this. An error channel that
+    is all noise is one nobody reads, which is the real cost -- the two genuine failures in
+    that period were a BrokenPipeError and a database lock, and neither was visible.
+
+    It is written by C, below anything contextlib.redirect_stderr can reach, so the file
+    descriptor itself is swapped. The window is exactly one PDFKit call: a Python traceback
+    raised in here would otherwise vanish with it.
+    """
+    saved = os.dup(2)
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    try:
+        os.dup2(devnull, 2)
+        yield
+    finally:
+        os.dup2(saved, 2)
+        os.close(devnull)
+        os.close(saved)
+
+
 def _pdf(path: str) -> str:
     from Quartz import PDFDocument
     from Foundation import NSURL
 
     url = NSURL.fileURLWithPath_(path)
-    doc = PDFDocument.alloc().initWithURL_(url)
+    with _quiet_stderr():
+        doc = PDFDocument.alloc().initWithURL_(url)
     if doc is None:
         raise ExtractionError("PDFKit could not open the document")
     if doc.isLocked():
         raise ExtractionError("PDF is password protected")
-    text = doc.string()
+    with _quiet_stderr():
+        text = doc.string()
     if not text or not text.strip():
         # Scanned documents carry no text layer. Say so rather than returning silence.
         raise ExtractionError(f"no text layer ({doc.pageCount()} pages, likely scanned)")

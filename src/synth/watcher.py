@@ -1,19 +1,23 @@
-"""Change detection.
+"""Change detection, and putting what changed on the queue.
 
-Detection is deliberately model-free: this process decides only *whether* something moved
-and hands a compact description to the reactor. That keeps a 2-minute cadence affordable,
-because quota is spent only when there is genuinely something to think about.
+Detection is deliberately model-free: this decides only *whether* something moved, and
+`enqueue` records it. Deciding what to do about it belongs to the reactor, and reading it
+belongs to the worker.
 
 Two detection routes, because Full Disk Access may or may not be granted to the daemon:
   * FSEvents (cheap, instant) for anything the daemon can see.
   * Content polling through AppleScript (works without FDA) for Mail and Notes.
+
+Both still run. FDA was granted on 2026-09-10, so FSEvents work again -- but the daemon has
+lost that grant before, silently, and the only symptom was that mail stopped being noticed
+promptly while every AppleScript call kept working. Polling is what makes that survivable
+rather than invisible, and `synth doctor` now reports the grant directly.
 """
 from __future__ import annotations
 
 import json
 import os
 import time
-from datetime import datetime, timezone
 
 from synth import config, db
 from synth.applekit import call
@@ -119,7 +123,13 @@ def poll_mail(state: dict) -> list[dict]:
         if known:  # first run only primes the cursor; it is not a flood of "new" mail
             for m in fresh:
                 events.append({
-                    "kind": "mail_new", "account": account,
+                    # The mailbox index travels with the event because reading a body needs
+                    # one -- mail_get_at takes (account, index, messageId) and there is no
+                    # lookup by Message-ID alone. Without it an event could be triaged on its
+                    # subject and never opened. It is a hint, not an address: indexes shift
+                    # on every arrival, so anything acting on this must re-resolve through
+                    # triage.resolve_indexes first and treat this as the fallback.
+                    "kind": "mail_new", "account": account, "index": m.get("index"),
                     "messageId": m["messageId"], "subject": m["subject"],
                     "sender": m["sender"], "receivedAt": m["receivedAt"],
                 })
@@ -134,8 +144,17 @@ def poll_notes(conn, state: dict) -> list[dict]:
     except Exception as e:
         return [{"kind": "notes_error", "detail": str(e)}]
     events = []
+    from synth import notes_sync
+
     for n in notes:
         live = db.text_hash(n["body"])
+        # A note whose content is exactly what Synth last wrote to it is not a correction,
+        # whoever wrote it and however long ago. notes_mirror covers the six rendered
+        # documents; synth_note covers everything else Synth writes -- create_note,
+        # append_note, and the brief -- which was previously invisible here and came back as
+        # an edit of Arun's that he never made.
+        if notes_sync.written_by_synth(conn, n["id"], live):
+            continue
         row = conn.execute(
             "SELECT doc, last_written_hash, last_seen_hash FROM notes_mirror WHERE note_id = ?",
             (n["id"],),
@@ -151,8 +170,10 @@ def poll_notes(conn, state: dict) -> list[dict]:
         if row["last_written_hash"] and live != row["last_written_hash"] \
                 and live != row["last_seen_hash"]:
             events.append({
+                # The hash is part of this event's identity: a second, different edit is new
+                # work, while re-detecting the same one every ninety seconds is not.
                 "kind": "note_edited", "noteId": n["id"], "doc": row["doc"],
-                "name": n["name"],
+                "name": n["name"], "hash": live,
             })
         conn.execute(
             "UPDATE notes_mirror SET last_seen_hash = ?, last_edit_at = "
@@ -170,35 +191,27 @@ def poll_notes(conn, state: dict) -> list[dict]:
 # Mail rewrites its store constantly. Treating them as work drove 800 reactor runs that
 # produced 13 reminders between them.
 ACTIONABLE = {"mail_new", "note_edited"}
-# EventKit changes are actionable, but only when Synth did not cause them itself.
-SELF_WINDOW_SECONDS = 600
-
-
-def caused_by_synth(conn, seconds: int = SELF_WINDOW_SECONDS) -> bool:
-    """Did Synth write to Calendar or Reminders just now?
-
-    The EventKit observer fires on Synth's own writes as loudly as on Arun's, so without this
-    every reminder Synth creates schedules another run to look at it.
-    """
-    row = conn.execute(
-        "SELECT at FROM action_log WHERE target_kind IN ('reminder','event') "
-        "ORDER BY id DESC LIMIT 1").fetchone()
-    if row is None:
-        return False
-    try:
-        last = datetime.fromisoformat(row["at"].replace("Z", "+00:00"))
-    except ValueError:
-        return False
-    if last.tzinfo is None:
-        last = last.replace(tzinfo=timezone.utc)
-    return (datetime.now(timezone.utc) - last).total_seconds() < seconds
 
 
 def actionable(conn, events: list[dict]) -> list[dict]:
+    """The events worth queueing, out of everything the detectors saw.
+
+    `eventkit_changed` used to be suppressed here whenever Synth had written to Calendar or
+    Reminders in the previous ten minutes, because the observer fires on Synth's own writes as
+    loudly as on Arun's. That guard was wrong in both directions: it swallowed a genuine edit
+    of his made just after a Synth write, and it failed open the moment the window passed.
+
+    It is gone, and nothing replaces it, because the work this event schedules is a *diff*.
+    tools.sync_obligations compares EventKit against the obligation table, and Synth's own
+    create_reminder has already written that row -- so a notification Synth caused finds
+    nothing and costs one free comparison. Idempotent by construction beats a timestamp
+    heuristic, and the worker never hands this kind to a model unless the diff found something
+    a person would care about.
+    """
     out = [e for e in events if e.get("kind") in ACTIONABLE]
-    if any(e.get("kind") == "eventkit_changed" for e in events) and not caused_by_synth(conn):
+    if any(e.get("kind") == "eventkit_changed" for e in events):
         out.append({"kind": "eventkit_changed",
-                    "detail": "Calendar or Reminders changed and Synth did not cause it"})
+                    "detail": "Calendar or Reminders changed; reconcile and see what moved"})
     return out
 
 
@@ -220,72 +233,67 @@ def collect(conn) -> list[dict]:
     return events
 
 
-def accumulate(events: list[dict]) -> dict:
-    """Hold events in a pending set until the debounce window closes.
+def dedupe_key(event: dict) -> str:
+    """What makes two detections the same piece of work.
 
-    A burst of edits collapses into one reactor run rather than one run per event, which is
-    what makes a short cadence safe for a subscription quota.
+    A message is itself, whoever noticed it and however often. A note edit is the note AND its
+    content, so a second, different edit is new work while re-detecting the same one is not --
+    which is the difference between a correction being handled once and being handled every
+    ninety seconds until Arun changes it again.
     """
-    pending = _load(PENDING, {"events": [], "first_at": None})
-    if events:
-        pending["events"].extend(events)
-        pending["first_at"] = pending["first_at"] or time.time()
-        _save(PENDING, pending)
-    return pending
+    kind = event.get("kind", "unknown")
+    if kind == "mail_new":
+        return f"mail_new:{event.get('messageId')}"
+    if kind == "note_edited":
+        return f"note_edited:{event.get('noteId')}:{event.get('hash', '')}"
+    if kind == "eventkit_changed":
+        # Not identity: EventKit tells us something moved and nothing about what. One pending
+        # row at a time is the whole point -- the work is a diff, and diffing twice for two
+        # notifications finds the same thing.
+        return "eventkit_changed"
+    return f"{kind}:{event.get('detail', '')[:120]}"
 
 
-def due(pending: dict) -> bool:
-    """Has the queue waited long enough to be worth a model?
+def enqueue(conn, events: list[dict]) -> int:
+    """Put detected work on the queue, once each.
 
-    Ordinary mail waits out a batching window, because the fixed cost of a run dwarfs the
-    marginal cost of another message in it -- the log is full of "mail: 1 event(s)" runs that
-    each paid about thirty cents to look at one newsletter. Anything urgent, and any change
-    Arun made himself, still goes at the short debounce.
+    The queue is a table rather than the old pending.json because the worker and the sweep are
+    separate processes: a JSON file has no way to say "claimed, in flight", and that is
+    precisely how one event gets handled twice.
     """
-    events = pending.get("events") or []
-    if not events:
-        return False
-    waited = time.time() - (pending.get("first_at") or 0)
-    if waited >= config.MAIL_BATCH_SECONDS:
-        return True
-    if waited < config.DEBOUNCE_SECONDS:
-        return False
-    # Past the short debounce: go now only if something here cannot wait.
-    return any(e.get("kind") != "mail_new" for e in events) or _has_urgent(events)
+    added = 0
+    for e in actionable(conn, events):
+        kind = e.get("kind", "unknown")
+        key = dedupe_key(e)
+        if kind == "eventkit_changed":
+            # Identity is global for a message and per-outstanding-batch for this one, because
+            # the work is a diff: two notifications and one notification find exactly the same
+            # thing. A constant key against a UNIQUE column would mean EventKit could be
+            # queued once in the lifetime of the database and never again, so the collapse is
+            # against PENDING rows and the key carries a timestamp to stay unique afterwards.
+            if conn.execute("SELECT 1 FROM reaction_queue WHERE kind = 'eventkit_changed' "
+                            "AND done_at IS NULL LIMIT 1").fetchone():
+                continue
+            # Sub-second, because db.now() is second-resolution: a notification processed
+            # and another arriving inside the same second produced the same key, hit the
+            # UNIQUE constraint, and the second one was silently dropped.
+            key = f"eventkit_changed:{time.time():.6f}"
+        cur = conn.execute(
+            "INSERT INTO reaction_queue (kind, dedupe_key, payload) VALUES (?,?,?) "
+            "ON CONFLICT (dedupe_key) DO NOTHING",
+            (kind, key, json.dumps(e, default=str)))
+        added += cur.rowcount
+    conn.commit()
+    return added
 
 
-def _has_urgent(events: list[dict]) -> bool:
-    mail = [e for e in events if e.get("kind") == "mail_new"]
-    if not mail:
-        return False
-    try:
-        from synth import triage as tri
-        conn = db.connect()
-        ctx = tri.context(conn)
-        return any(tri.classify(m, ctx)[0] == "urgent" for m in mail)
-    except Exception:
-        # If urgency cannot be judged, let the batching window decide rather than firing.
-        return False
-
-
-def clear_pending():
-    _save(PENDING, {"events": [], "first_at": None})
-
-
-def keep_only(handled: list[dict], all_events: list[dict]) -> int:
-    """Drop what a run finished with; keep the rest queued.
-
-    The old code cleared the queue whenever `react` returned, including when every call had
-    been refused by the API. Two days of detected mail was discarded that way and never came
-    back, so nothing here may throw an event away that was not actually dealt with.
-    """
-    def key(e):
-        return (e.get("kind"), e.get("messageId") or e.get("noteId") or e.get("detail"))
-
-    done = {key(e) for e in handled}
-    left = [e for e in all_events if key(e) not in done]
-    if left:
-        _save(PENDING, {"events": left, "first_at": time.time()})
-    else:
-        clear_pending()
-    return len(left)
+# The pending.json queue that used to live here -- accumulate, due, _has_urgent, keep_only
+# and clear_pending -- is gone. reaction_queue replaced it: a file cannot express "claimed, in
+# flight", and the worker and the sweep are separate processes, which is exactly how one event
+# gets handled twice.
+#
+# What those functions knew is not lost. The two-tier debounce became reaction_queue's
+# enqueued_at window, and `keep_only`'s rule -- that an event a run did not finish with stays
+# queued -- is now worker.release(), written the same way and for the same reason: the code
+# before it cleared the queue whenever the reactor returned, including when every call had
+# been refused, and two days of detected mail was discarded that way and never came back.

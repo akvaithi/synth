@@ -9,6 +9,12 @@ dependencies = [
     "cryptography<49",
     "markitdown[docx,outlook,pptx,xls,xlsx]>=0.1.7",
     "mcp>=2.0.0",
+    # Semantic search ranks by cosine over ~9,000 chunk vectors, which is one matmul and a
+    # few milliseconds -- an ANN index would buy nothing at this size and would cost a native
+    # extension that db.connect() must load on every single connection. numpy was already in
+    # the venv, but only because onnxruntime pulls it; a dependency that arrives by accident
+    # leaves the moment something else drops it, and search would break on a `uv sync`.
+    "numpy>=2",
     "pyobjc-framework-Cocoa>=10.3",
     "pyobjc-framework-EventKit>=10.3",
     "pyobjc-framework-quartz>=12.2.2",

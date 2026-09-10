@@ -108,6 +108,46 @@ def update_event(conn, *, id, reason, run_id=None, evidence_id=None, **fields):
                run_id=run_id, evidence_id=evidence_id)
 
 
+# ---------------------------------------------------------------- deletes
+#
+# These exist because Arun prompting Synth directly should not be told "there is no way to do
+# that" about his own calendar. They are not offered to the autonomous tier at all: the
+# capability sets in mcp_server and agent decide who may reach them, and this module is only
+# where the write and its log entry become inseparable.
+#
+# `before` is captured in full on every one of them, because for two of the three it is the
+# only thing that could ever rebuild the item -- and rebuilding is not undoing. Each tool
+# docstring says which it is rather than letting "undo" imply more than it can do.
+
+
+def delete_reminder(conn, *, id, reason, run_id=None, evidence_id=None):
+    """Remove a reminder. Reversible only as a recreation: EventKit issues a new identifier,
+    so anything holding the old one -- an obligation row, a link -- is pointing at nothing."""
+    return _do(conn, "delete_reminder", "reminder", reason, {"id": id},
+               run_id=run_id, evidence_id=evidence_id)
+
+
+def delete_event(conn, *, id, reason, run_id=None, evidence_id=None):
+    """Remove a calendar event. Recreation, not restoration, for the same reason."""
+    return _do(conn, "delete_event", "event", reason, {"id": id},
+               run_id=run_id, evidence_id=evidence_id)
+
+
+def delete_note(conn, *, id, reason, run_id=None):
+    """Move a note to Recently Deleted, where Notes keeps it for thirty days.
+
+    That is a better guarantee than anything here could offer and it is left as it is. The
+    body is still recorded, because thirty days is not forever and because `why` should be
+    able to show what was removed without asking Notes.
+    """
+    _require_reason(reason)
+    result = call("notes_delete", id=id)
+    before = result.get("before")
+    action_id = db.log_action(conn, "delete_note", "note", reason, run_id=run_id,
+                              target_id=id, before=before, after=None)
+    return action_id, result
+
+
 def notes_update(conn, *, id, body, reason, name=None, run_id=None):
     params = {"id": id, "body": body}
     if name:

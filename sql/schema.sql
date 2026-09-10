@@ -316,3 +316,134 @@ CREATE TABLE IF NOT EXISTS mail_digest (
 
 CREATE INDEX IF NOT EXISTS mail_digest_unreported
     ON mail_digest (reported_at) WHERE reported_at IS NULL;
+
+
+-- ---------------------------------------------------------------- local inference
+--
+-- What Synth depends on and whether it is there. Background reasoning runs on models on
+-- Arun's own network, reached through a Cloudflare Access TCP tunnel, so a second machine is
+-- now in the critical path and it can be absent without anything looking wrong.
+--
+-- `since` moves only when `up` flips. Overwriting it on every probe is how a warning that is
+-- supposed to fire after sustained downtime never fires at all: the outage is always one
+-- probe old.
+CREATE TABLE IF NOT EXISTS service_health (
+    service          TEXT PRIMARY KEY,          -- 'ollama' | 'synthd' | 'claude'
+    up               INTEGER NOT NULL,
+    checked_at       TEXT NOT NULL,
+    since            TEXT,                      -- when it entered the state it is in now
+    last_ok_at       TEXT,
+    consecutive_bad  INTEGER NOT NULL DEFAULT 0,
+    detail           TEXT                       -- version when up, the error when down
+);
+
+-- ---------------------------------------------------------------- semantic index
+--
+-- FTS5 answers "which document contains this word". It cannot answer "which document is
+-- ABOUT this", which is what search_context is usually asked -- _fts_escape strips
+-- punctuation and ORs every term, so a four-word question matches anything holding any one
+-- of them. Embeddings answer the second question and are bad at the first: an exact
+-- identifier, a course number, a person's name are what FTS is for. Both run, and the
+-- document results are fused rather than one replacing the other.
+CREATE TABLE IF NOT EXISTS embedding (
+    id           INTEGER PRIMARY KEY,
+    kind         TEXT NOT NULL CHECK (kind IN ('document','assertion','entity','predicate')),
+    ref_id       INTEGER NOT NULL,
+    chunk        INTEGER NOT NULL DEFAULT 0,
+    start_char   INTEGER NOT NULL DEFAULT 0,
+    chars        INTEGER NOT NULL DEFAULT 0,
+    -- Hash of the chunk, so a hit can be shown without re-reading the file and a re-embed
+    -- can prove the source has not moved underneath it. Deliberately NOT source.content_hash:
+    -- ocr_pass rewrites the cached text while the file's own hash stays exactly the same.
+    text_hash    TEXT NOT NULL,
+    model        TEXT NOT NULL,                 -- e.g. 'nomic-embed-text/prefixed'
+    dims         INTEGER NOT NULL,
+    vector       BLOB NOT NULL,                 -- float32 little-endian, dims * 4 bytes
+    embedded_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (kind, ref_id, chunk)
+);
+
+CREATE INDEX IF NOT EXISTS idx_embedding_ref ON embedding (kind, ref_id);
+
+-- What still needs embedding. A backfill over 1,924 documents runs through a model that
+-- serves one request at a time, so it must be resumable, and a document that cannot be
+-- embedded must not be retried for ever.
+CREATE TABLE IF NOT EXISTS embedding_queue (
+    kind        TEXT NOT NULL,
+    ref_id      INTEGER NOT NULL,
+    text_hash   TEXT NOT NULL,
+    enqueued_at TEXT NOT NULL DEFAULT (datetime('now')),
+    attempts    INTEGER NOT NULL DEFAULT 0,
+    last_error  TEXT,
+    done_at     TEXT,
+    PRIMARY KEY (kind, ref_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_embedding_queue_pending
+    ON embedding_queue (enqueued_at) WHERE done_at IS NULL;
+
+-- ---------------------------------------------------------------- reacting
+--
+-- Detected events waiting to be acted on. This was a JSON file, which cannot express
+-- "claimed, in flight" -- and the worker and the sweep are separate processes, so that is
+-- exactly how one event gets handled twice.
+--
+-- Rows are marked done, never deleted, so "was this message ever reacted to" is a query
+-- rather than a guess. prune-state drops them once they are old.
+CREATE TABLE IF NOT EXISTS reaction_queue (
+    id           INTEGER PRIMARY KEY,
+    kind         TEXT NOT NULL,                 -- mail_new / note_edited / eventkit_changed
+    -- The idempotency marker. mail_new:<messageId>; note_edited:<noteId>:<live_hash>, so a
+    -- second, different edit is new work while a re-detection of the same one is not.
+    dedupe_key   TEXT NOT NULL UNIQUE,
+    payload      TEXT NOT NULL,
+    enqueued_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    claimed_at   TEXT,
+    claimed_by   INTEGER,                       -- pid, so a dead claimant is recognisable
+    attempts     INTEGER NOT NULL DEFAULT 0,
+    last_error   TEXT,
+    done_at      TEXT,
+    run_id       INTEGER REFERENCES run_log(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_reaction_pending
+    ON reaction_queue (enqueued_at) WHERE done_at IS NULL;
+
+-- Every note Synth has written, and the hash Notes actually STORED afterwards.
+--
+-- notes_mirror keeps this for the six rendered documents. This keeps it for everything else
+-- Synth writes -- briefs, create_note, append_note -- because poll_notes reads any note whose
+-- live hash differs from what Synth last wrote as a correction from Arun. Without this row a
+-- note Synth wrote itself comes back as a correction nobody made, which holds the mirror and
+-- files a phantom edit. The hash is of what Notes returned after the write, never of what was
+-- composed: Notes rewrites HTML on save and the two are never equal.
+CREATE TABLE IF NOT EXISTS synth_note (
+    note_id      TEXT PRIMARY KEY,
+    folder       TEXT NOT NULL,
+    name         TEXT,
+    written_hash TEXT NOT NULL,
+    written_at   TEXT NOT NULL DEFAULT (datetime('now')),
+    action_id    INTEGER REFERENCES action_log(id),
+    purpose      TEXT                           -- 'brief' | 'note' | 'mirror'
+);
+
+-- Whether a document is about Arun at all.
+--
+-- Enrichment used to run over a curated set of about seventy files, so this question never
+-- arose. Local inference makes it affordable to consider all 1,924 -- and that is exactly
+-- when it starts to matter, because the corpus is mostly NOT about him: CHEN 201 and POLS 207
+-- textbooks, lab handouts, other people's papers. Asked to extract "facts about Arun" from a
+-- thermodynamics chapter, a model will find some, record them at high confidence with a real
+-- source, and supersede true facts with them. The Superseded/ resume incident is the same
+-- failure arriving from a different direction.
+--
+-- Cached because the answer does not change unless the file does, and asking is the cheap
+-- half of the pass.
+CREATE TABLE IF NOT EXISTS enrich_gate (
+    document_id  INTEGER PRIMARY KEY REFERENCES document(id) ON DELETE CASCADE,
+    relevant     INTEGER NOT NULL,
+    why          TEXT,
+    text_hash    TEXT NOT NULL,
+    model        TEXT,
+    at           TEXT NOT NULL DEFAULT (datetime('now'))
+);

@@ -23,7 +23,7 @@ anything that is a draft of an opinion rather than a fact.
 - Use `add_facts`, **one call per document**, always passing that document's `document_id`.
   That is what links each fact back to the file that stated it.
 - **Entity names must be canonical and reusable.** "Goldwater Scholarship", not "the
-  Goldwater". If an entity plausibly already exists, call `search_context` first and reuse
+  Goldwater". If an entity plausibly already exists, call `search` first and reuse
   the exact existing name, otherwise you will create duplicates that are painful to merge.
 - **Confidence is meaningful.** 1.0 only for something the document states outright. Lower it
   for anything you inferred, and say so in the predicate or description.
@@ -43,5 +43,5 @@ it can be raised with Arun rather than silently resolved.
 
 {documents}
 
-Read each with `read_document`. When you are done, summarise in a few lines: what you
+Read each with `document`. When you are done, summarise in a few lines: what you
 recorded, what you deliberately skipped, and anything that contradicted existing data.

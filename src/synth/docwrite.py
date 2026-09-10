@@ -213,7 +213,9 @@ def _upsert_document(conn, src_id: int, rel_path: str, text: str) -> int:
         cur = conn.execute(
             "INSERT INTO document (source_id, path, title, text, chars) VALUES (?,?,?,?,?) "
             "RETURNING id", (src_id, rel_path, title, text, len(text)))
-        return cur.fetchone()[0]
+        doc_id = cur.fetchone()[0]
+        _mark_for_embedding(conn, doc_id, text)
+        return doc_id
 
     # UPDATE, never DELETE+INSERT: enrichment.document_id is a foreign-key primary key on
     # document(id) and foreign_keys is ON, so deleting the row would either fail outright or
@@ -225,7 +227,31 @@ def _upsert_document(conn, src_id: int, rel_path: str, text: str) -> int:
                  "VALUES ('delete', ?, ?, ?)", (row["id"], row["title"], row["text"]))
     conn.execute("INSERT INTO document_fts (rowid, title, text) VALUES (?,?,?)",
                  (row["id"], title, text))
+    _mark_for_embedding(conn, row["id"], text)
     return row["id"]
+
+
+def _mark_for_embedding(conn, doc_id: int, text: str) -> None:
+    """Queue this document for a vector, next to the FTS maintenance above.
+
+    Here for the same reason the FTS maintenance is here: this is the one function every
+    document write passes through, so it is the only place the semantic index can be kept in
+    step without a second list of callers to remember.
+
+    It only ENQUEUES. Embedding runs through a model that serves one request at a time over a
+    tunnel to another machine, and indexer.build calls this for hundreds of rows inside the
+    sweep's write transaction -- doing the work here would hold the SQLite write lock for
+    minutes. embed.mark is also a no-op when the text has not actually changed, which is what
+    stops every sweep from re-embedding all 1,924 documents: the indexer reconsiders every
+    row on every pass whether or not it wrote anything.
+    """
+    try:
+        from synth import embed
+        embed.mark(conn, "document", doc_id, db.text_hash(text or ""))
+    except Exception:
+        # A document that cannot be queued for a vector is still a document that was written.
+        # Search degrades; indexing must not fail.
+        pass
 
 
 # ---------------------------------------------------------------- undo

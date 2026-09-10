@@ -138,3 +138,85 @@ def test_collapse_is_idempotent(conn):
 
     assert len(predicates.collapse_same_key(conn)) == 1
     assert predicates.collapse_same_key(conn) == []
+
+
+# ---------------------------------------------------------------- one fact, several names
+
+def test_embedding_distance_cannot_separate_synonyms_from_neighbours():
+    """Recorded so it is not tried again. nomic-embed-text measures topical relatedness, not
+    synonymy, and the two distributions overlap completely -- 'home address' and 'email
+    address' scored 0.80 while 'UIN' and 'university ID number' scored 0.69. No threshold
+    admits the second and refuses the first, which is why this is a model judgement."""
+    import inspect
+
+    from synth import predicates
+
+    source = inspect.getsource(predicates)
+    assert "SEMANTIC_THRESHOLD" not in source, "a cosine threshold cannot do this job"
+    assert "same_fact" in source
+
+
+def test_a_judgement_that_cannot_be_made_never_merges(monkeypatch):
+    """Local inference being away must mean 'do not merge', never 'merge anyway'. Leaving two
+    names live is untidy; merging two real facts destroys one of them."""
+    from synth import ollama, predicates
+
+    monkeypatch.setattr(ollama, "generate_json",
+                        lambda *a, **k: (_ for _ in ()).throw(ollama.OllamaDown("away")))
+    same, why = predicates.same_fact("UIN", "university ID number")
+    assert same is False
+    assert "unjudged" in why
+
+
+def test_a_judgement_is_asked_once_per_pair(monkeypatch):
+    """The pairs are few, but a cluster compares each against each and the same two names come
+    round repeatedly."""
+    from synth import ollama, predicates
+
+    calls = []
+
+    def counted(prompt, schema, **kw):
+        calls.append(prompt)
+        return {"same_fact": True, "why": "the same"}
+
+    monkeypatch.setattr(ollama, "generate_json", counted)
+    cache = {}
+    predicates.same_fact("UIN", "university ID number", cache=cache)
+    predicates.same_fact("university ID number", "UIN", cache=cache)
+    assert len(calls) == 1, "the reversed pair asked again"
+
+
+def test_a_numbered_series_is_never_offered_for_merging(conn, monkeypatch):
+    """siblings() stays decisive and is checked before any judgement: 'term GPA - Spring 2025'
+    and 'term GPA - Spring 2026' are near-identical by every measure and are two facts."""
+    from synth import facts, ollama, predicates
+
+    monkeypatch.setattr(ollama, "generate_json",
+                        lambda *a, **k: {"same_fact": True, "why": "they look alike"})
+    eid = facts.upsert_entity(conn, "person", "Arun")
+    facts.assert_fact(conn, eid, "term GPA - Spring 2025", num=4.0)
+    facts.assert_fact(conn, eid, "term GPA - Spring 2026", num=4.0)
+    conn.commit()
+    mergeable, _ = predicates.clusters(conn)
+    assert mergeable == [], "a series was offered for merging"
+
+
+def test_two_names_for_one_fact_are_found_even_when_they_share_no_words(conn, monkeypatch):
+    """The UIN was live three times under three names for months, because the tool meant to
+    find it was comparing characters."""
+    from synth import facts, ollama, predicates
+
+    monkeypatch.setattr(ollama, "generate_json",
+                        lambda *a, **k: {"same_fact": True, "why": "both are the UIN"})
+    eid = facts.upsert_entity(conn, "person", "Arun")
+    facts.assert_fact(conn, eid, "UIN", text="123456789")
+    facts.assert_fact(conn, eid, "university identification number", text="123456789")
+    conn.commit()
+    mergeable, _ = predicates.clusters(conn)
+    assert len(mergeable) == 1
+    cluster = [mergeable[0]["keep"], *mergeable[0]["supersede"]]
+    names = {r["predicate"] for r in cluster}
+    assert names == {"UIN", "university identification number"}
+    # Which one survives depends on observed_at; what matters is that the pair was found by
+    # judgement rather than by spelling, since they share no words at all.
+    assert any("judged" in r.get("_matched_by", "") for r in cluster)

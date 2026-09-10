@@ -1,0 +1,30 @@
+#!/bin/bash
+# The forward that makes local inference reachable at all.
+#
+# The Access application in front of ollama.akvaithi.page is TCP-mode, not HTTP. A plain
+# HTTPS request to the hostname authenticates -- Cloudflare issues a JWT and returns 200 --
+# and then hands back an empty body on every path, including /api/tags. So `cloudflared
+# access tcp` is not a convenience here, it is the only way in, and anything that "simplifies"
+# this into an HTTP client with two headers will get 200s that look healthy and carry nothing.
+#
+# One forward for the whole machine, under launchd, rather than one per caller: four
+# processes want Ollama (the sweep, the reactor worker, the nightly enrich, an interactive
+# `synth call`) and each spawning its own would race for the port and pay the edge handshake
+# again every time.
+#
+# Port 11435 rather than Ollama's own 11434, so that if a local Ollama is ever installed on
+# this VM the two cannot silently shadow each other and leave callers talking to the wrong one.
+set -euo pipefail
+
+ENV_FILE="$HOME/.config/synth/ollama-tunnel.env"
+if [ ! -r "$ENV_FILE" ]; then
+    echo "missing $ENV_FILE (needs TUNNEL_SERVICE_TOKEN_ID and TUNNEL_SERVICE_TOKEN_SECRET)" >&2
+    exit 78   # EX_CONFIG: a configuration problem, not a crash to be restarted forever
+fi
+set -a
+. "$ENV_FILE"
+set +a
+
+exec "$HOME/.local/bin/cloudflared" access tcp \
+    --hostname ollama.akvaithi.page \
+    --url "127.0.0.1:${SYNTH_OLLAMA_PORT:-11435}"

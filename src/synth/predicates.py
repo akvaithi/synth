@@ -99,7 +99,77 @@ def _value(row) -> tuple:
 # ---------------------------------------------------------------- deduplication
 
 
-def clusters(conn, threshold: float = 0.80) -> tuple[list[dict], list[dict]]:
+# Two predicate names mean the same thing when they READ the same, which SequenceMatcher
+# measures, or when they MEAN the same, which it cannot see at all. "UIN", "university ID
+# number" and "student identification number" share almost no characters and score far below
+# any usable threshold -- and lowering the threshold far enough to catch them starts merging
+# things that are genuinely different. That is why the three UIN spellings sat live for
+# months: the tool meant to find them was measuring the wrong thing.
+#
+# Embedding cosine was tried here first and does not work, which is worth recording so it is
+# not tried again. nomic-embed-text measures topical relatedness, not synonymy, and the two
+# distributions overlap completely:
+#
+#     UIN / university ID number            0.69   <- same fact
+#     overall GPA / cumulative GPA          0.72   <- same fact
+#     start date / end date                 0.76   <- DIFFERENT facts
+#     home address / email address          0.80   <- DIFFERENT facts
+#
+# There is no threshold that admits the first pair and refuses the last. Asking a model is the
+# right shape of question -- "are these two names for one fact?" is a judgement, not a
+# distance -- and it is free, because the pairs it is asked about already share an entity and
+# an identical value, so there are only ever a handful.
+SAME_FACT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "same_fact": {"type": "boolean"},
+        "why": {"type": "string"},
+    },
+    "required": ["same_fact", "why"],
+}
+
+SAME_FACT_PROMPT = """These are two predicate names from a personal-knowledge database about
+one person. They are recorded against the same subject and hold exactly the same value.
+
+Decide whether they are two names for ONE fact, or two genuinely different facts that happen
+to share a value.
+
+Same fact: "UIN" and "university ID number". "overall GPA" and "cumulative grade point
+average". "deadline" and "application due date".
+
+Different facts: "home address" and "email address" — both are addresses, and a person has
+both. "start date" and "end date". "term GPA - Spring 2025" and "term GPA - Spring 2026".
+
+If in doubt, answer false. Leaving two names live is untidy; merging two real facts destroys
+one of them.
+
+A: {a}
+B: {b}
+
+Answer with JSON: same_fact (boolean), why (one short sentence)."""
+
+
+def same_fact(a: str, b: str, cache: dict | None = None) -> tuple[bool, str]:
+    """Are these two predicate names one fact? Judged by a model, not by distance."""
+    from synth import ollama
+
+    ck = tuple(sorted((key(a), key(b))))
+    if cache is not None and ck in cache:
+        return cache[ck]
+    try:
+        answer = ollama.generate_json(SAME_FACT_PROMPT.format(a=a, b=b), SAME_FACT_SCHEMA,
+                                      tier="fast")
+        out = (bool(answer.get("same_fact")), str(answer.get("why", ""))[:200])
+    except Exception as e:
+        # Unavailable means "do not merge", never "merge anyway".
+        out = (False, f"unjudged: {type(e).__name__}")
+    if cache is not None:
+        cache[ck] = out
+    return out
+
+
+def clusters(conn, threshold: float = 0.80, use_semantic: bool = True
+             ) -> tuple[list[dict], list[dict]]:
     """Live assertions that are one fact under several predicate names.
 
     Returns (mergeable, reported). A cluster is MERGEABLE when the values are identical, the
@@ -119,6 +189,22 @@ def clusters(conn, threshold: float = 0.80) -> tuple[list[dict], list[dict]]:
     for r in rows:
         by_value.setdefault((r["entity_id"], r["_val"]), []).append(r)
 
+    judged: dict = {}
+
+    def alike(a: str, b: str) -> tuple[bool, str]:
+        """Do these two names mean one fact? Spelling first, then a judgement.
+
+        Spelling is free and settles the easy cases. The model is only asked about pairs that
+        already share an entity and an identical value and did not match on spelling, which is
+        a handful per run.
+        """
+        if similar(a, b) >= threshold:
+            return True, "spelling"
+        if not use_semantic:
+            return False, ""
+        same, why = same_fact(a, b, cache=judged)
+        return (True, f"judged: {why}") if same else (False, "")
+
     mergeable, reported = [], []
     for (_eid, _val), group in by_value.items():
         if len(group) < 2 or all(v is None for v in _val):
@@ -131,12 +217,20 @@ def clusters(conn, threshold: float = 0.80) -> tuple[list[dict], list[dict]]:
             for b in group[i + 1:]:
                 if b["id"] in used or b["_key"] == a["_key"]:
                     continue
-                if not siblings(a["predicate"], b["predicate"]) \
-                        and similar(a["predicate"], b["predicate"]) >= threshold:
+                # siblings() stays decisive and is checked FIRST: a differing digit-bearing
+                # token means a series, and "term GPA Spring 2025" and "term GPA Spring 2026"
+                # are near-identical by both measures while being two different facts.
+                if siblings(a["predicate"], b["predicate"]):
+                    continue
+                match, why = alike(a["predicate"], b["predicate"])
+                if match:
+                    b["_matched_by"] = why
                     same.append(b)
                     used.add(b["id"])
             if len(same) > 1:
                 used.add(a["id"])
+                # The anchor is in the cluster too; without this it reports as unmatched.
+                a.setdefault("_matched_by", "anchor")
                 # Newest survives: it is the spelling most recently in use.
                 same.sort(key=lambda r: (r["observed_at"], r["id"]))
                 mergeable.append({"entity": a["entity"], "keep": same[-1],
