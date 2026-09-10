@@ -26,10 +26,12 @@
     <dict>
         <key>PATH</key>
         <string>/Users/akvaithi/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
-        <!-- Analyse everything, write nothing. Removed only after a week of `synth log`
-             has been read by hand and the decisions look like ones Arun would have made. -->
-        <key>SYNTH_REACTOR_DRY_RUN</key>
-        <string>1</string>
+        <!-- Live as of 2026-09-10: it writes. Two acts per run rather than the default
+             four for the first stretch -- the cap is what turns a generous grader into one
+             that has to rank, and the overflow is named in the brief rather than lost.
+             `touch .state/HALT` stops it at its next write without unloading anything. -->
+        <key>SYNTH_MAX_ACTS</key>
+        <string>2</string>
     </dict>
     <key>StandardOutPath</key>
     <string>/Users/akvaithi/Developer/synth/.state/worker.out.log</string>
