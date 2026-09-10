@@ -9,7 +9,11 @@ import EventKit
 // process. So the real mode of operation is `daemon`: launchd starts it, it holds the
 // grants, and everything else talks to it over a Unix socket.
 //
-// Never deletes anything. Completion, not deletion.
+// Deletion lives behind a tier, not behind this file. The daemon implements delete for
+// reminders, events and notes and will carry out whichever it is asked; which callers may ask
+// is decided in Python, where action_log and the capability sets are. Arun prompting Synth
+// directly gets all of it; the autonomous reactor gets read, write and edit and never delete.
+// Anything reaching this socket directly bypasses that distinction entirely.
 
 let store = EKEventStore()
 let iso: ISO8601DateFormatter = {
@@ -118,9 +122,13 @@ func listReminders(includeCompleted: Bool) -> [[String: Any]] {
 
 // MARK: - writes
 //
-// Doctrine: never delete. Completion, not deletion. Partial updates only — a field the
-// caller did not name is never cleared. Every write returns the prior state so the caller
-// can record an undo entry.
+// Partial updates only — a field the caller did not name is never cleared. Every write
+// returns the prior state so the caller can record an undo entry.
+//
+// Completion is still preferred to deletion, and the reactor cannot delete at all. Where a
+// delete does happen, `before` carries everything needed to build the thing again -- but for
+// events and notes that is a recreation with a new identifier, not a restoration, and the
+// Python layer says so rather than implying undo puts it back.
 
 func findReminderCalendar(_ nameOrId: String?) throws -> EKCalendar {
     let cals = store.calendars(for: .reminder)
@@ -282,6 +290,24 @@ func deleteReminder(_ req: [String: Any]) throws -> [String: Any] {
     return ["removed": true, "before": before]
 }
 
+func deleteEvent(_ req: [String: Any]) throws -> [String: Any] {
+    // The snapshot is the whole point. EventKit assigns an identifier on save, so removing an
+    // event is not reversible in the way an edit is -- putting it back means creating a new
+    // one that looks the same and has a different id. Everything needed to recreate it goes
+    // into `before` so that undo has something to work from at all; the Python layer is where
+    // the honesty about "recreated, not restored" lives.
+    guard let id = req["id"] as? String else { throw SynthError(msg: "id is required") }
+    guard let e = store.event(withIdentifier: id) else {
+        throw SynthError(msg: "no event with identifier \(id)")
+    }
+    guard let cal = e.calendar, cal.allowsContentModifications else {
+        throw SynthError(msg: "calendar \(e.calendar?.title ?? "?") is read-only")
+    }
+    let before = eventSnapshot(e)
+    try store.remove(e, span: .thisEvent, commit: true)
+    return ["removed": true, "before": before]
+}
+
 func createEvent(_ req: [String: Any]) throws -> [String: Any] {
     guard let title = req["title"] as? String, !title.isEmpty else {
         throw SynthError(msg: "title is required")
@@ -440,6 +466,32 @@ func notesUpdate(id: String, body: String, name: String?) throws -> [String: Any
     """
     let old = try runAppleScript(src)
     return ["id": id, "before": ["body": old]]
+}
+
+func notesDelete(id: String) throws -> [String: Any] {
+    // Notes has no true delete: `delete` moves the note to Recently Deleted, where it stays
+    // for thirty days and can be put back by hand. That is a better guarantee than anything
+    // this daemon could offer, so it is left as-is rather than dressed up.
+    //
+    // The body is read first so `before` can carry it. Notes rewrites HTML on save, so what
+    // comes back is what Notes stored rather than what was written -- a recreation from this
+    // is approximate in its markup and exact in its words.
+    let src = """
+    tell application "Notes"
+        set theNote to note id \(asQuote(id))
+        set theName to name of theNote
+        set theBody to body of theNote
+        delete theNote
+        return theName & (character id 31) & theBody
+    end tell
+    """
+    let raw = try runAppleScript(src)
+    let parts = raw.components(separatedBy: US)
+    return ["removed": true, "before": [
+        "id": id,
+        "name": parts.first ?? "",
+        "body": parts.count > 1 ? parts[1...].joined(separator: US) : "",
+    ]]
 }
 
 func notesGet(id: String) throws -> [String: Any] {
@@ -958,6 +1010,8 @@ func handle(_ req: [String: Any]) -> [String: Any] {
             return ["ok": true, "result": try createEvent(req)]
         case "update_event":
             return ["ok": true, "result": try updateEvent(req)]
+        case "delete_event":
+            return ["ok": true, "result": try deleteEvent(req)]
         case "notes_folders":
             return ["ok": true, "result": try notesFolders()]
         case "notes_ensure_folder":
@@ -966,6 +1020,9 @@ func handle(_ req: [String: Any]) -> [String: Any] {
         case "notes_dump":
             let f = (req["folder"] as? String) ?? "Synth"
             return ["ok": true, "result": try notesDump(folder: f)]
+        case "notes_delete":
+            guard let i = req["id"] as? String else { throw SynthError(msg: "id is required") }
+            return ["ok": true, "result": try notesDelete(id: i)]
         case "notes_get":
             guard let id = req["id"] as? String else { throw SynthError(msg: "id is required") }
             return ["ok": true, "result": try notesGet(id: id)]
@@ -1169,6 +1226,14 @@ func diag() -> [String: Any] {
 // MARK: - unix socket server
 
 func serve(socketPath: String, queuePath: String) -> Never {
+    // A client that gives up before reading its answer used to take the whole daemon with
+    // it: write() to a hung-up peer raises SIGPIPE, whose default disposition is to
+    // terminate the process. applekit.call() does exactly that every time its socket
+    // timeout fires -- the `with s:` block closes the fd while the daemon is still working.
+    // launchd's KeepAlive then restarted us, so the symptom was never a crash anyone saw.
+    // It was the *next* caller finding the socket refused, and whatever was in flight lost
+    // without ever reaching action_log.
+    signal(SIGPIPE, SIG_IGN)
     unlink(socketPath)
     let fd = socket(AF_UNIX, SOCK_STREAM, 0)
     guard fd >= 0 else { FileHandle.standardError.write("socket() failed\n".data(using: .utf8)!); exit(1) }
@@ -1202,43 +1267,94 @@ func serve(socketPath: String, queuePath: String) -> Never {
     installFileWatchers()
 
     let q = DispatchQueue(label: "page.akvaithi.synth.accept")
+    // Reading and writing move off the accept loop; executing does not. Every request still
+    // runs one at a time on `work`, because EventKit and the AppleScript bridge have never
+    // been asked to serve two callers at once and a socket fix is not the change that should
+    // start asking. What this buys is that a client which is slow, silent, or already gone
+    // now costs only its own connection -- before, it held the single accept loop and every
+    // caller queued behind it timed out, hung up, and (until the SIG_IGN above) killed the
+    // daemon on the way out.
+    let work = DispatchQueue(label: "page.akvaithi.synth.work")
+    let io = DispatchQueue(label: "page.akvaithi.synth.io", attributes: .concurrent)
+    let slots = DispatchSemaphore(value: 32)
     q.async {
         while true {
             let client = Darwin.accept(fd, nil, nil)
-            if client < 0 { continue }
-
-            // Read until EOF. A single read() returns only what is currently buffered, so a
-            // request larger than one chunk -- a rendered Notes document, for instance --
-            // arrived truncated and the client saw a broken pipe. The client half-closes
-            // after writing, which is what ends this loop.
-            var request = Data()
-            var buf = [UInt8](repeating: 0, count: 65536)
-            while true {
-                let n = Darwin.read(client, &buf, buf.count)
-                if n <= 0 { break }
-                request.append(contentsOf: buf[0..<n])
+            if client < 0 {
+                if errno == EINTR || errno == ECONNABORTED { continue }
+                continue
             }
 
-            var response: [String: Any]
-            if request.isEmpty {
-                response = ["ok": false, "error": "empty request"]
-            } else if let obj = try? JSONSerialization.jsonObject(with: request) as? [String: Any] {
-                response = handle(obj)
-            } else {
-                response = ["ok": false, "error": "malformed json request"]
-            }
+            // Belt and braces with the SIG_IGN above: writing to a peer that has gone away
+            // returns EPIPE on this fd rather than raising a signal at all.
+            var noSigPipe: Int32 = 1
+            setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE,
+                       &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
+            // A client that connects and then never speaks holds a slot, not the daemon.
+            // No real request pauses for thirty seconds mid-body.
+            var rcvTimeout = timeval(tv_sec: 30, tv_usec: 0)
+            setsockopt(client, SOL_SOCKET, SO_RCVTIMEO,
+                       &rcvTimeout, socklen_t(MemoryLayout<timeval>.size))
 
-            // Write fully: a large response will not go out in one call either.
-            let out = Array((encode(response) + "\n").utf8)
-            var written = 0
-            while written < out.count {
-                let n = out.withUnsafeBufferPointer { p -> Int in
-                    Darwin.write(client, p.baseAddress! + written, out.count - written)
+            slots.wait()
+            io.async {
+                defer {
+                    Darwin.close(client)
+                    slots.signal()
                 }
-                if n <= 0 { break }
-                written += n
+
+                // Read until EOF. A single read() returns only what is currently buffered,
+                // so a request larger than one chunk -- a rendered Notes document, for
+                // instance -- arrived truncated and the client saw a broken pipe. The client
+                // half-closes after writing, which is what ends this loop.
+                var request = Data()
+                var buf = [UInt8](repeating: 0, count: 65536)
+                var readFailed = false
+                while true {
+                    let n = Darwin.read(client, &buf, buf.count)
+                    if n > 0 {
+                        request.append(contentsOf: buf[0..<n])
+                        continue
+                    }
+                    if n == 0 { break }               // half-close: the request is complete
+                    if errno == EINTR { continue }    // a signal, not an end
+                    readFailed = true                 // timed out, or the connection broke
+                    break
+                }
+
+                var response: [String: Any]
+                if readFailed {
+                    // Treating a truncated body as a whole one is how a half-read request
+                    // becomes a half-meant action.
+                    response = ["ok": false, "error": "request timed out or failed mid-read"]
+                } else if request.isEmpty {
+                    response = ["ok": false, "error": "empty request"]
+                } else if let obj = try? JSONSerialization.jsonObject(with: request)
+                            as? [String: Any] {
+                    var executed: [String: Any] = [:]
+                    work.sync { executed = handle(obj) }
+                    response = executed
+                } else {
+                    response = ["ok": false, "error": "malformed json request"]
+                }
+
+                // Write fully: a large response will not go out in one call either.
+                let out = Array((encode(response) + "\n").utf8)
+                var written = 0
+                while written < out.count {
+                    let n = out.withUnsafeBufferPointer { p -> Int in
+                        Darwin.write(client, p.baseAddress! + written, out.count - written)
+                    }
+                    if n > 0 {
+                        written += n
+                        continue
+                    }
+                    if n < 0 && errno == EINTR { continue }
+                    // The client hung up before reading. That is now an EPIPE on one fd,
+                    // which costs that caller its answer and costs everyone else nothing.
+                    break
+                }
             }
-            Darwin.close(client)
         }
     }
     RunLoop.main.run()
