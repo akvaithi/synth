@@ -50,6 +50,24 @@ MAX_WRITES = 4
 WALL_SECONDS = 600
 MAX_CONSECUTIVE_ERRORS = 3
 
+# A small model narrates a plan and treats having said it as having done it. Watching the
+# reactor decide about an email headed "Action Required - RSVP ... for TAMU Dell Night 2026":
+# it read the body, correctly judged it actionable, called already_scheduled, got back no
+# matches at all -- and then stopped, with a closing message that read "I need to check if
+# this is already scheduled. I will check for an event titled ...". It had already checked.
+# The answer was sitting in front of it and it described the intention instead of using it.
+#
+# So a run that ends having only LOOKED, while saying it meant to act, is asked once. Once,
+# not repeatedly: a model that declines twice is declining, and pushing further would be
+# arguing with it until it writes something to make the question stop.
+INTENT = ("i will ", "i'll ", "i need to ", "i should ", "next, i", "i am going to ",
+          "i plan to ", "let me ")
+
+NUDGE = ("You described what you were going to do rather than doing it. The tool results "
+         "above are the answer to whatever you were checking — read them and finish. If the "
+         "answer means no action is warranted, say that plainly instead. Do not restate the "
+         "plan.")
+
 # Tools whose signature does not describe them well enough to call.
 #
 # Two take **fields, which a signature cannot describe at all. The third is worse and was only
@@ -129,6 +147,33 @@ REQUIRED_OVERRIDES = {
     "add_facts": ["payload"],
 }
 
+# Descriptions for parameter names whose meaning a model cannot infer from the name alone.
+# A derived schema gives every string the same shape, so `account` and `mailbox` arrive
+# indistinguishable and gemma4 filled both with "College" -- ten wasted calls in the first
+# live hour, each burning a turn and pushing the run toward the tool it did understand.
+#
+# Keyed by name rather than by tool because these mean the same thing everywhere they appear,
+# and the ones that do not need explaining are left out: `title`, `reason` and `due` say what
+# they are.
+PARAM_DESCRIPTIONS = {
+    "account": "which of Arun's four mail accounts: Work, College, Personal or iCloud",
+    "mailbox": "the folder WITHIN that account, e.g. 'INBOX' or 'Sent Mail'. This is NOT the "
+               "account name — leave it out unless you mean a folder other than the inbox.",
+    "index": "the message's position in the mailbox, from the event or from `mail`",
+    "messageId": "the RFC822 Message-ID, which is what actually identifies the message",
+    "ek_identifier": "the stored EventKit identifier, never the title",
+    "when": "ISO 8601, e.g. 2026-09-15T18:00:00",
+    "due": "ISO 8601 with a time. An untimed reminder never appears in Calendar, which is "
+           "where Arun reads his day.",
+    "start": "ISO 8601, with a time",
+    "end": "ISO 8601, with a time",
+    "calendar": "one of the writable calendars: Personal, Semester Calendar, College Events, "
+                "Meetings. Anything else is refused.",
+    "list": "an existing Reminders list. Synth cannot create one; an unknown name is refused.",
+    "reason": "why this helps Arun, in plain words he would understand months from now",
+    "evidence_source": "the Message-ID of the mail that justifies this",
+}
+
 _JSON_TYPES = {
     str: "string", int: "integer", float: "number", bool: "boolean",
     list: "array", dict: "object",
@@ -166,7 +211,10 @@ def schema_for(name: str) -> dict:
         for p in inspect.signature(fn).parameters.values():
             if p.name in INJECTED or p.kind is inspect.Parameter.VAR_KEYWORD:
                 continue
-            props[p.name] = _json_type(p.annotation)
+            spec = _json_type(p.annotation)
+            if p.name in PARAM_DESCRIPTIONS:
+                spec["description"] = PARAM_DESCRIPTIONS[p.name]
+            props[p.name] = spec
             if p.default is inspect.Parameter.empty:
                 required.append(p.name)
     return {"type": "function", "function": {
@@ -239,6 +287,7 @@ def run(conn, *, job: str, trigger: str, system: str, user: str,
     seen: dict[str, dict] = {}
     writes = 0
     consecutive_errors = 0
+    nudged = False
     text = ""
     stop = "done"
 
@@ -262,6 +311,12 @@ def run(conn, *, job: str, trigger: str, system: str, user: str,
         messages.append({"role": "assistant", "content": message.get("content") or "",
                          **({"tool_calls": requested} if requested else {})})
         if not requested:
+            lower = text.lower()
+            if (not nudged and writes == 0 and calls
+                    and any(p in lower for p in INTENT)):
+                nudged = True
+                messages.append({"role": "user", "content": NUDGE})
+                continue
             stop = "done"
             break
 

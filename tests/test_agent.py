@@ -295,3 +295,50 @@ def test_a_failed_call_is_logged_with_the_arguments_it_used(conn, model, tools):
         row = conn.execute("SELECT detail FROM run_log WHERE id = ?", (run_id,)).fetchone()
     failures = json.loads(row["detail"])["failures"]
     assert failures and failures[0]["args"] == {"account": "Work"}
+
+
+def test_a_run_that_narrates_a_plan_is_asked_once_to_finish(conn, model, tools):
+    """A small model says what it is going to do and treats having said it as having done it.
+
+    Watching the reactor decide about an email headed "Action Required - RSVP ... for TAMU
+    Dell Night 2026": it read the body, judged it actionable, called already_scheduled, got
+    back no matches at all -- and stopped, closing with "I need to check if this is already
+    scheduled. I will check for an event titled ...". It had already checked. The answer was
+    in front of it and it described the intention instead of using it.
+    """
+    r = _run(conn, [{"content": "", "tool_calls": [_tool_call("a_read", q="x")]},
+                    {"content": "I will create a reminder for this.", "tool_calls": []},
+                    {"content": "", "tool_calls": [_tool_call("a_write", title="t",
+                                                              reason="a good enough reason")]},
+                    {"content": "done", "tool_calls": []}], model)
+    assert r["writes"] == 1, "the nudge did not get it to finish"
+    assert [e for e in tools if e[0] == "write"]
+
+
+def test_a_run_is_only_nudged_once(conn, model, tools):
+    """A model that declines twice is declining. Pushing further would be arguing with it
+    until it writes something to make the question stop."""
+    r = _run(conn, [{"content": "", "tool_calls": [_tool_call("a_read", q="x")]},
+                    {"content": "I will do it.", "tool_calls": []},
+                    {"content": "I will really do it.", "tool_calls": []}], model)
+    assert r["stop"] == "done"
+    assert r["writes"] == 0
+
+
+def test_a_run_that_simply_concluded_is_not_nudged(conn, model, tools):
+    """Doing nothing is a valid and frequent outcome. Only an unfinished INTENTION is pushed
+    on -- a plain conclusion is the answer."""
+    r = _run(conn, [{"content": "", "tool_calls": [_tool_call("a_read", q="x")]},
+                    {"content": "This is a newsletter. No action needed.", "tool_calls": []}],
+             model)
+    assert r["stop"] == "done"
+    assert r["turns"] == 1
+
+
+def test_ambiguous_parameters_are_described_to_the_model():
+    """A derived schema gives every string the same shape, so `account` and `mailbox` arrived
+    indistinguishable and gemma4 filled both with "College" -- ten wasted calls in the first
+    live hour, each burning a turn."""
+    props = agent.schema_for("mail_links")["function"]["parameters"]["properties"]
+    assert "NOT the account name" in props["mailbox"]["description"]
+    assert "Work, College, Personal or iCloud" in props["account"]["description"]
