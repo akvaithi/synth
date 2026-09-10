@@ -32,6 +32,11 @@
              `touch .state/HALT` stops it at its next write without unloading anything. -->
         <key>SYNTH_MAX_ACTS</key>
         <string>2</string>
+        <!-- No daily ceiling, at Arun's instruction on 2026-09-10. What still bounds a
+             runaway: two acts per run, twelve turns, a ten-minute wall clock, repeat-call
+             suppression, and .state/HALT. -->
+        <key>SYNTH_MAX_WRITES_PER_DAY</key>
+        <string>0</string>
     </dict>
     <key>StandardOutPath</key>
     <string>/Users/akvaithi/Developer/synth/.state/worker.out.log</string>

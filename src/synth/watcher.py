@@ -287,6 +287,56 @@ def enqueue(conn, events: list[dict]) -> int:
     return added
 
 
+def backfill_mail(conn, days: int = 14, limit: int = 0, verdicts=("urgent", "consider"),
+                  dry_run: bool = False) -> dict:
+    """Queue mail that was indexed before the reactor existed.
+
+    poll_mail emits an event only for a Message-ID absent from its per-account cursor, and the
+    sweep primed that cursor months ago. So everything already in the index is invisible to
+    detection: turning the reactor on helps with mail that arrives afterwards and does nothing
+    at all about what is already sitting there. On the day it went live that was 89 messages
+    the free rules had called urgent or worth considering, going back a fortnight, including
+    an RSVP marked "Action Required" and a support ticket awaiting a reply.
+
+    Only what the free rules could not settle is offered. `digest` and `ignore` were decided by
+    static rules and learned sender policy, and re-deciding them with a model is how a backlog
+    becomes a flood.
+
+    Bounded by age because a reminder for a deadline that has already passed is noise, and
+    newest first because that is where the live obligations are.
+    """
+    rows = conn.execute(
+        f"SELECT message_id, account, sender, subject, received_at, mail_index "
+        f"FROM mail_digest WHERE verdict IN ({','.join('?' * len(verdicts))}) "
+        f"AND received_at > datetime('now', ?) "
+        f"ORDER BY received_at DESC",
+        (*verdicts, f"-{days} days")).fetchall()
+
+    already = {r[0] for r in conn.execute(
+        "SELECT replace(dedupe_key, 'mail_new:', '') FROM reaction_queue "
+        "WHERE kind = 'mail_new'")}
+    fresh = [r for r in rows if r["message_id"] not in already]
+    if limit:
+        fresh = fresh[:limit]
+
+    if dry_run:
+        return {"would_queue": len(fresh), "considered": len(rows),
+                "messages": [{"received": db.local(r["received_at"]),
+                              "account": r["account"], "sender": r["sender"],
+                              "subject": r["subject"]} for r in fresh]}
+
+    added = 0
+    for r in fresh:
+        added += enqueue(conn, [{
+            "kind": "mail_new", "account": r["account"], "index": r["mail_index"],
+            "messageId": r["message_id"], "subject": r["subject"],
+            "sender": r["sender"], "receivedAt": r["received_at"],
+            "backfilled": True,
+        }])
+    return {"queued": added, "considered": len(rows), "skipped_already_seen":
+            len(rows) - len(fresh)}
+
+
 # The pending.json queue that used to live here -- accumulate, due, _has_urgent, keep_only
 # and clear_pending -- is gone. reaction_queue replaced it: a file cannot express "claimed, in
 # flight", and the worker and the sweep are separate processes, which is exactly how one event
