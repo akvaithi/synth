@@ -40,7 +40,11 @@ from synth import agent, db, registry
 # Beyond this a single run carries so much unrelated material that judgement degrades, and a
 # run that stops half way leaves the work silently incomplete -- which is how a reply that had
 # already been sent got a reminder telling Arun to send it.
-MAX_EVENTS_PER_RUN = int(os.environ.get("SYNTH_MAX_EVENTS_PER_RUN", "12"))
+MAX_EVENTS_PER_RUN = int(os.environ.get("SYNTH_MAX_EVENTS_PER_RUN", "4"))
+
+# Characters of each message body handed to the model. Enough for a deadline, an RSVP or an
+# ask to be in the text; short enough that four of them and the doctrine fit comfortably.
+BODY_CHARS = int(os.environ.get("SYNTH_BODY_CHARS", "2500"))
 
 # The most a single batch may act on. Asked to sort twelve subjects, the old triage called six
 # actionable -- including a football ticket promotion. A ceiling turns a generous grader into
@@ -67,6 +71,37 @@ SCHEDULE_TOOLS = ["obligations", "agenda", "already_scheduled", "entity",
 TOOLSETS = {"mail": MAIL_TOOLS, "note_edited": NOTE_TOOLS, "schedule": SCHEDULE_TOOLS}
 
 
+def read_bodies(conn, events: list[dict]) -> list[dict]:
+    """Put each message's text on the event, rather than leaving the model to go and get it.
+
+    It would not go and get it. Given a batch and a mail_read tool, gemma4 answered from the
+    subject lines in turn zero: across the first fourteen live runs, thirteen never opened a
+    single message. It told itself so explicitly -- an email headed "Action Required - RSVP
+    Directly with Dell Technologies" was dismissed as not creating "a concrete, trackable
+    obligation ... based on the content alone", having never read the content.
+
+    That is not a prompt problem to argue with. A small model takes the cheap path, and the
+    cheap path here is to summarise what it was already shown. So the body is fetched first
+    and put in front of it, the same way `already_scheduled` became a pre-flight rather than
+    an instruction. Reading is no longer a decision it can get wrong.
+    """
+    from synth import tools
+
+    for e in events:
+        if e.get("kind") != "mail_new" or e.get("body"):
+            continue
+        try:
+            got = tools.mail_read(conn, e.get("account"), e.get("index"), e.get("messageId"))
+            text = (got.get("body") or got.get("content") or "").strip()
+            e["body"] = text[:BODY_CHARS]
+            e["body_truncated"] = len(text) > BODY_CHARS
+        except Exception as ex:
+            # A body that cannot be read is worth saying so about: the model should know it is
+            # deciding on the subject line, rather than assuming it saw everything.
+            e["body"] = f"(could not be read: {type(ex).__name__})"
+    return events
+
+
 def summarise(events: list[dict], cap: int = 60) -> str:
     """Compact a batch into something worth a model's attention."""
     by_kind: dict[str, list[dict]] = {}
@@ -81,6 +116,10 @@ def summarise(events: list[dict], cap: int = 60) -> str:
                              f"from {e.get('sender', '')}\n"
                              f"  subject: {e.get('subject', '')}\n"
                              f"  messageId: {e.get('messageId')}  index: {e.get('index', '?')}")
+                if e.get("body"):
+                    ellipsis = " […]" if e.get("body_truncated") else ""
+                    body = e["body"].replace("\n", "\n    ")
+                    lines.append(f"  body:\n    {body}{ellipsis}")
         elif kind == "note_edited":
             lines.append(f"### {len(group)} mirror note(s) Arun edited")
             for e in group:
@@ -178,6 +217,7 @@ def react(conn, events: list[dict], dry_run: bool | None = None,
 
     rest = [e for e in events if e.get("kind") != "eventkit_changed"]
     rest = refresh_indexes(conn, rest)
+    rest = read_bodies(conn, rest)
     for kind in ("mail_new", "note_edited"):
         group = [e for e in rest if e.get("kind") == kind]
         for i in range(0, len(group), MAX_EVENTS_PER_RUN):

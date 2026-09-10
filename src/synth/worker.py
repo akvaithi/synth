@@ -43,10 +43,15 @@ DEBOUNCE_SECONDS = getattr(config, "DEBOUNCE_SECONDS", 15)
 HEALTH_RETRY_SECONDS = 30
 LOCK_WAIT_SECONDS = 900
 
-# Everything a run may write is capped by agent.run. This is the ceiling across all runs in a
-# day, which is the number the 142-writes-a-day incident is about. Past it the worker keeps
-# analysing and stops writing, and says so.
-MAX_WRITES_PER_DAY = int(os.environ.get("SYNTH_MAX_WRITES_PER_DAY", "20"))
+# The ceiling across all runs in a day -- the number the 142-writes-a-day incident is about.
+# **Zero means no limit**, which is how it is set: Arun asked for it unlimited on 2026-09-10,
+# after watching it work a backlog of 89 messages and write almost nothing.
+#
+# What still bounds a runaway with this off: two acts per run, twelve turns, a ten-minute wall
+# clock, repeat-call suppression, and .state/HALT. Those are per-run and structural. This one
+# was the only ceiling counted across a day, so with it lifted the day is bounded by how much
+# mail actually arrives.
+MAX_WRITES_PER_DAY = int(os.environ.get("SYNTH_MAX_WRITES_PER_DAY", "0"))
 
 MAX_ATTEMPTS = 3
 
@@ -59,14 +64,31 @@ NOT_A_WRITE = ("sync_obligations",)
 
 
 def writes_today(conn) -> int:
-    """Autonomous writes since local midnight: action_log rows belonging to a reactor run."""
+    """Actions a reactor run took since local midnight.
+
+    Reminders, events and notes go through actions._do and leave an action_log row carrying
+    the run that made them, so these are attributable and countable.
+
+    Facts are NOT included, and the omission is deliberate rather than an oversight. add_facts
+    calls facts.ingest_batch, which inserts assertions and commits without logging an action
+    and without recording which run asked -- so an assertion cannot be attributed to the
+    reactor rather than to the nightly enrichment pass, and counting all of today's would
+    charge the reactor for enrichment's work. `facts_today` reports them separately instead of
+    summing two things that are not the same and cannot be told apart.
+    """
     placeholders = ",".join("?" * len(NOT_A_WRITE))
-    row = conn.execute(
+    return conn.execute(
         "SELECT count(*) FROM action_log a JOIN run_log r ON r.id = a.run_id "
         "WHERE r.job = 'reactor' AND a.at > datetime('now', 'start of day') "
         f"AND a.action NOT IN ({placeholders}) AND NOT {db.HOUSEKEEPING}",
-        NOT_A_WRITE).fetchone()
-    return row[0] if row else 0
+        NOT_A_WRITE).fetchone()[0]
+
+
+def facts_today(conn) -> int:
+    """Assertions recorded today, by anything. See writes_today for why this is separate."""
+    return conn.execute(
+        "SELECT count(*) FROM assertion WHERE observed_at > datetime('now', 'start of day')"
+    ).fetchone()[0]
 
 
 def claim(conn, limit: int = 12) -> list[dict]:
@@ -146,7 +168,7 @@ def once(conn, dry_run: bool | None = None) -> dict:
     if not claimed:
         return {"claimed": 0}
 
-    capped = writes_today(conn) >= MAX_WRITES_PER_DAY
+    capped = MAX_WRITES_PER_DAY > 0 and writes_today(conn) >= MAX_WRITES_PER_DAY
     if capped:
         dry_run = True
 
@@ -248,6 +270,7 @@ def status(conn) -> dict:
     except (OSError, ValueError):
         mode = {"dry_run": None, "pid": None, "at": None}
     return {"pending": pending, "retired": retired, "writes_today": writes_today(conn),
-            "cap": MAX_WRITES_PER_DAY, "halted": agent.halted(),
+            "facts_today": facts_today(conn),
+            "cap": MAX_WRITES_PER_DAY or "unlimited", "halted": agent.halted(),
             "worker_dry_run": mode.get("dry_run"), "worker_pid": mode.get("pid"),
             "worker_last_pass": mode.get("at"), "lock": LOCK}

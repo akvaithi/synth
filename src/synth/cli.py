@@ -14,6 +14,7 @@
     synth why <id>       why it did one thing
     synth undo <id>      reverse one action
     synth work [--once|--status|--dry-run]  drain the reaction queue
+    synth work --backfill [--days=N|--limit=N|--dry-run]  queue mail indexed before the reactor
     synth brief [morning|evening]  write and deliver the brief
     synth embed [--backfill|--stats]  build the semantic index
     synth status         health of every moving part
@@ -694,10 +695,21 @@ def cmd_work(args):
         synth work --status   what is queued, what has been written today
         synth work --dry-run  analyse and write nothing, whatever the halt file says
     """
-    from synth import reactor, worker
+    from synth import reactor, watcher, worker
     conn = db.connect()
     if "--status" in args:
         print(json.dumps(worker.status(conn), indent=2))
+        return 0
+    if "--backfill" in args:
+        days = next((int(a.split("=", 1)[1]) for a in args if a.startswith("--days=")), 14)
+        limit = next((int(a.split("=", 1)[1]) for a in args if a.startswith("--limit=")), 0)
+        result = watcher.backfill_mail(conn, days=days, limit=limit,
+                                       dry_run="--dry-run" in args)
+        if "--dry-run" in args:
+            for m in result.pop("messages", []):
+                print(f"  {m['received']}  [{m['account']}] {(m['sender'] or '')[:32]:<32} "
+                      f"{(m['subject'] or '')[:56]}")
+        print(json.dumps(result, indent=2))
         return 0
     dry = True if "--dry-run" in args else (True if reactor.DRY_RUN else None)
     result = worker.loop(conn, dry_run=dry, forever="--once" not in args)
