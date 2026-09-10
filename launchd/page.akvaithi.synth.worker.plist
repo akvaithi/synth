@@ -31,7 +31,7 @@
              that has to rank, and the overflow is named in the brief rather than lost.
              `touch .state/HALT` stops it at its next write without unloading anything. -->
         <key>SYNTH_MAX_ACTS</key>
-        <string>2</string>
+        <string>4</string>
         <!-- No daily ceiling, at Arun's instruction on 2026-09-10. What still bounds a
              runaway: two acts per run, twelve turns, a ten-minute wall clock, repeat-call
              suppression, and .state/HALT. -->
