@@ -158,7 +158,29 @@ def test_the_connector_says_what_actually_runs_unprompted(recording):
     body = mcp_server.build().instructions
     for real in ("The sweep", "The brief", "Enrichment", "The reactor"):
         assert real in body, f"the doctrine does not mention {real}"
-    assert "dry-run" in body, "the reactor's current state must be stated, not implied"
+
+
+def test_the_doctrine_agrees_with_the_job_that_actually_runs(recording):
+    """The doctrine ships as the MCP server's instructions, so a stale sentence here is a
+    lie told to the connector -- which is exactly what happened once already, when it said
+    autonomy "is not coming back" while the reactor was running.
+
+    Checked against the plist rather than against a fixed string, because the claim that
+    matters is agreement: whichever way the flag is set, the doctrine has to say so. This
+    fails if someone flips one without the other, in either direction.
+    """
+    import pathlib
+
+    plist = pathlib.Path(__file__).parent.parent / "launchd" \
+        / "page.akvaithi.synth.worker.plist"
+    dry = "SYNTH_REACTOR_DRY_RUN" in plist.read_text()
+    body = _flat(mcp_server.build().instructions)
+
+    if dry:
+        assert "in dry-run" in body, "the worker writes nothing and the doctrine implies it does"
+    else:
+        assert "in dry-run" not in body, "the worker writes and the doctrine claims dry-run"
+        assert "it **writes**" in body, "the doctrine must say plainly that it writes"
 
 
 def _flat(text: str) -> str:

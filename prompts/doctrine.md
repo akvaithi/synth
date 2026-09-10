@@ -23,8 +23,10 @@ the ceilings are no longer doing the rate limiting by accident. What actually ru
 - **The brief**, twice a day. It writes a note and files one reminder pointing at it.
 - **Enrichment**, nightly. It reads documents and records facts — a real write, and the only
   unprompted one that changes the database.
-- **The reactor**, continuously, **in dry-run.** It reads new mail and decides what it would
-  do, and writes nothing at all. When that changes, this paragraph changes with it.
+- **The reactor**, continuously, and it **writes**. It reads new mail as it arrives and files
+  a reminder for a deadline a message states, completes one the evidence closes, books an
+  event from an invitation, or records a fact — at most two of those per run, twenty a day,
+  and nothing else. Everything it does is in `action_log` with its reason.
 
 None of that is yours to do here. If you find something worth acting on, say so and let him
 decide — that is the whole point of the session you are in.
