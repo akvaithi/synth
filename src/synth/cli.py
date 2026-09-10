@@ -5,7 +5,7 @@
     synth ingest         read Documents, extract text, cache it
     synth index          load extracted document text into the searchable index
     synth ocr            OCR the scanned PDFs that had no text layer
-    synth enrich         extract structured facts from documents (the one model pass)
+    synth enrich [--limit=N|--dry-run|--claude|--no-gate]  extract facts from documents
     synth notes          re-render the Notes mirror
     synth reconcile      align stored note hashes with what Notes actually holds
     synth call <name> [json]  direct tool dispatch (see: synth call)
@@ -13,7 +13,11 @@
     synth log            what Synth has done
     synth why <id>       why it did one thing
     synth undo <id>      reverse one action
+    synth work [--once|--status|--dry-run]  drain the reaction queue
+    synth brief [morning|evening]  write and deliver the brief
+    synth embed [--backfill|--stats]  build the semantic index
     synth status         health of every moving part
+    synth doctor [--json]  what is broken right now, and nothing else
     synth budget [clear|reset <why>]  what it has spent, and what it may spend
     synth dedupe-predicates [--merge <keep_id> <id>...]  one fact under several names
     synth suspect-sources    live facts sourced from documents enrichment now excludes
@@ -48,22 +52,50 @@ def _save_json(path, obj):
     os.replace(tmp, path)
 
 
-def _exclusive():
+def _exclusive(wait: float = 0.0):
     """Hold a lock for the whole reaction, or bail out.
 
     A run regularly outlasts the 120s launchd interval, so two passes overlapped and both
     created the same reminder -- one run's own summary says "a reminder already existed from
     a concurrent Synth process".
+
+    `wait` is for the jobs that must not simply skip. The sweep is periodic, so bailing out
+    costs it nothing -- it runs again in half an hour. Enrichment is a nightly appointment
+    and a typed command is a request, so both wait instead. They did neither: only cmd_sync
+    ever took this lock, and the 03:00 enrich job overlapped the 03:00 sweep every night it
+    landed together. run_log still holds the result -- "killed by database lock during
+    concurrent OCR pass".
     """
     import fcntl
+    import time as _time
     os.makedirs(os.path.dirname(LOCK), exist_ok=True)
     fh = open(LOCK, "w")
-    try:
-        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        fh.close()
-        return None
-    return fh
+    deadline = _time.time() + wait
+    while True:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fh
+        except OSError:
+            if _time.time() >= deadline:
+                fh.close()
+                return None
+            _time.sleep(0.5)
+
+
+def _locked_or_exit(what: str, wait: float = 1800.0):
+    """Take the sweep lock for a command that writes, or explain why it did not run.
+
+    Every command that writes to the database takes this. SQLite's own busy timeout does not
+    help here: the sweep holds its write transactions across OCR and AppleScript calls that
+    run for minutes, so a second writer does not queue politely, it fails partway through
+    whatever it had already begun.
+    """
+    held = _exclusive(wait=wait)
+    if held is None:
+        print(json.dumps({
+            "skipped": f"{what} did not run: another Synth process held the lock for "
+                       f"{int(wait)}s. It is probably a long sweep; try again after it."}))
+    return held
 
 
 # launchd appends to StandardOutPath for ever and rotates nothing. These four files only
@@ -122,6 +154,9 @@ def cmd_budget(args):
 def cmd_ingest(args):
     """Read Documents, extract text, cache it. Free: no model is involved."""
     from synth import ingest
+    held = _locked_or_exit("ingest")
+    if held is None:
+        return 0
     conn = db.connect()
     limit = None
     for a in args:
@@ -222,7 +257,17 @@ def cmd_sync(args):
             notes[doc] = f"{type(e).__name__}: {e}"
     out["notes"] = notes
 
-    watcher.clear_pending()
+    # Semantic index. Bounded, because this runs inside the half-hour timer and embedding
+    # goes over a tunnel to another machine: it takes whatever slice it can finish and leaves
+    # the rest queued rather than making the sweep's length depend on a remote service. Costs
+    # nothing when nothing changed, since docwrite only queues a document whose text moved.
+    try:
+        from synth import embed
+        result = embed.drain(conn, budget_seconds=90)
+        if result.get("embedded") or result.get("stopped"):
+            out["embed"] = result
+    except Exception as e:
+        out["embed"] = f"{type(e).__name__}: {e}"
 
     # Free, and the only place that runs often enough to keep the state directory bounded.
     rotated = rotate_logs()
@@ -241,6 +286,11 @@ def cmd_sync(args):
 
 def cmd_migrate(args):
     """Bring the database up to the current schema, and tidy it. Safe to run twice."""
+    # ANALYZE and a WAL checkpoint both want the database to themselves, and migrate may be
+    # creating tables the sweep is about to read.
+    held = _locked_or_exit("migrate")
+    if held is None:
+        return 0
     conn = db.connect()
     steps = db.migrate(conn)
     print("\n".join(f"  {s}" for s in steps) if steps else "  already current")
@@ -385,6 +435,9 @@ def cmd_suspect_sources(args):
 
 def cmd_index(args):
     from synth import indexer
+    held = _locked_or_exit("index")
+    if held is None:
+        return 0
     conn = db.connect()
     print(json.dumps(indexer.build(conn), indent=2))
     return 0
@@ -392,6 +445,9 @@ def cmd_index(args):
 
 def cmd_ocr(args):
     from synth import indexer
+    held = _locked_or_exit("ocr")
+    if held is None:
+        return 0
     conn = db.connect()
     limit = int(args[0]) if args else None
     print(json.dumps(indexer.ocr_pass(conn, limit=limit), indent=2))
@@ -400,24 +456,61 @@ def cmd_ocr(args):
 
 def cmd_enrich(args):
     from synth import enrich
+    # The nightly job is at 03:00 and so is a sweep; whichever lost the race was killed
+    # partway through. It waits now rather than skipping, because enrichment that silently
+    # does not happen looks exactly like enrichment that found nothing to do.
+    held = _locked_or_exit("enrich")
+    if held is None:
+        return 0
     conn = db.connect()
     dry = "--dry-run" in args
+    limit = 0
     extra = 0
     for a in args:
+        if a.startswith("--limit="):
+            limit = int(a.split("=", 1)[1])
         if a.startswith("--extra="):
             extra = int(a.split("=", 1)[1])
-    docs, skipped = enrich.select_with_skipped(conn, extra_limit=extra)
-    print(f"{len(docs)} document(s) selected for extraction, {len(skipped)} excluded")
-    for s in skipped:
-        print(f"    excluded  {s['path']}  ({s['why']})")
-    results = enrich.run(conn, docs, dry_run=dry)
-    print(json.dumps({"batches": len(results),
-                      "errors": sum(1 for r in results if r.get("error"))}, indent=2))
+
+    # Metered Claude over the curated set is still here, because it is a better extractor and
+    # a large backlog is a reasonable thing to spend money on deliberately. It is no longer
+    # the default: the local pass costs nothing and can therefore consider the whole corpus.
+    if "--claude" in args:
+        docs, skipped = enrich.select_with_skipped(conn, extra_limit=extra)
+        print(f"{len(docs)} document(s) selected, {len(skipped)} excluded  [metered Claude]")
+        for sk in skipped:
+            print(f"    excluded  {sk['path']}  ({sk['why']})")
+        results = enrich.run(conn, docs, dry_run=dry)
+        print(json.dumps({"batches": len(results),
+                          "errors": sum(1 for r in results if r.get("error"))}, indent=2))
+        return 0
+
+    docs, skipped = enrich.select_all(conn, limit=limit)
+    print(f"{len(docs)} document(s) to consider, {len(skipped)} excluded by rule  [local]")
+    seconds = enrich.NIGHTLY_SECONDS
+    for a in args:
+        if a.startswith("--seconds="):
+            seconds = float(a.split("=", 1)[1])
+    results = enrich.run_local(conn, docs, dry_run=dry,
+                               use_gate="--no-gate" not in args, budget_seconds=seconds)
+    gated = [r for r in results if r.get("gated")]
+    ran = [r for r in results if "stop" in r]
+    print(json.dumps({
+        "considered": len(results),
+        "gated_out": len(gated),
+        "extracted": len(ran),
+        "facts_written": sum(r.get("writes", 0) for r in ran),
+        "stopped_early": [r["stop"] for r in ran if r["stop"] not in ("done", "writes")],
+        "budget_exhausted": any(r.get("stopped") == "budget" for r in results),
+    }, indent=2))
     return 0
 
 
 def cmd_notes(args):
     from synth import notes_sync
+    held = _locked_or_exit("notes")
+    if held is None:
+        return 0
     conn = db.connect()
     with db.run(conn, "notes_sync", trigger="manual") as run_id:
         print(json.dumps(notes_sync.sync_all(conn, run_id=run_id), indent=2))
@@ -466,6 +559,11 @@ def cmd_call(args):
 
 def cmd_reconcile(args):
     from synth import notes_sync
+    # Reconciling while a sweep is re-rendering the mirror would record the hash of a note
+    # that is about to be rewritten, which is the phantom-correction bug from the other side.
+    held = _locked_or_exit("reconcile")
+    if held is None:
+        return 0
     conn = db.connect()
     print(json.dumps(notes_sync.reconcile(conn), indent=2))
     print("pending after:", notes_sync.pending_corrections(conn))
@@ -511,6 +609,18 @@ def cmd_status(args):
         print(f"    tcc        {call('status', timeout=15)}")
     except SynthdError as e:
         print(f"    UNREACHABLE {e}")
+    print("inference")
+    from synth import ollama
+    probe = ollama.health()
+    if probe.get("up"):
+        print(f"    ollama     up, version {probe['version']}")
+        try:
+            for m in ollama.loaded():
+                print(f"    resident   {m['name']}  {m['on_gpu']}% on GPU, ctx {m['context']}")
+        except Exception:
+            pass
+    else:
+        print(f"    ollama     DOWN — {probe.get('error')}")
     print("budget")
     from synth import budget
     for line in budget.summary(conn).splitlines():
@@ -528,8 +638,99 @@ def cmd_status(args):
     return 0
 
 
+def cmd_embed(args):
+    """Build and maintain the semantic index.
+
+        synth embed                drain whatever is queued
+        synth embed --backfill     queue every document, then drain it
+        synth embed --stats        what the index holds
+    """
+    from synth import embed
+    held = _locked_or_exit("embed")
+    if held is None:
+        return 0
+    conn = db.connect()
+    if "--stats" in args:
+        print(json.dumps(embed.stats(conn), indent=2))
+        return 0
+    if "--backfill" in args:
+        marked = embed.enqueue_all(conn, "document")
+        print(f"queued {marked} document(s)")
+    seconds = 120.0
+    for a in args:
+        if a.startswith("--seconds="):
+            seconds = float(a.split("=", 1)[1])
+    if "--backfill" in args and not any(a.startswith("--seconds=") for a in args):
+        # A backfill is a deliberate one-off, not a slice of a sweep.
+        seconds = 86400.0
+    with db.run(conn, "embed", trigger="manual") as run_id:
+        result = embed.drain(conn, budget_seconds=seconds)
+        conn.execute("UPDATE run_log SET summary = ? WHERE id = ?",
+                     (json.dumps(result)[:2000], run_id))
+        conn.commit()
+    print(json.dumps(result, indent=2))
+    print(json.dumps(embed.stats(conn), indent=2))
+    return 0
+
+
+def cmd_brief(args):
+    """Write and deliver one brief. `synth brief morning` or `synth brief evening`."""
+    from synth import brief
+    when = "evening" if "evening" in args else "morning"
+    held = _locked_or_exit("brief")
+    if held is None:
+        return 0
+    conn = db.connect()
+    result = brief.write(conn, when)
+    print(json.dumps(result, indent=2, default=str))
+    return 0 if result.get("delivered") else 1
+
+
+def cmd_work(args):
+    """Drain the reaction queue as work appears. The resident reactor.
+
+        synth work            run forever (this is what launchd starts)
+        synth work --once     one pass, for looking at what it would do
+        synth work --status   what is queued, what has been written today
+        synth work --dry-run  analyse and write nothing, whatever the halt file says
+    """
+    from synth import reactor, worker
+    conn = db.connect()
+    if "--status" in args:
+        print(json.dumps(worker.status(conn), indent=2))
+        return 0
+    dry = True if "--dry-run" in args else (True if reactor.DRY_RUN else None)
+    result = worker.loop(conn, dry_run=dry, forever="--once" not in args)
+    print(json.dumps(result, indent=2, default=str))
+    return 0
+
+
+def cmd_doctor(args):
+    """What is broken right now, and nothing else.
+
+    Exits non-zero when something is actually failing, so it can be the thing a monitor or a
+    launchd job runs rather than something only a person reads.
+    """
+    from synth import doctor
+    conn = db.connect()
+    findings = doctor.run_all(conn)
+    if "--json" in args:
+        print(json.dumps(findings, indent=2))
+    else:
+        if not findings:
+            print("ok — everything Synth depends on is answering.")
+        for f in findings:
+            mark = {"fail": "FAIL", "warn": "warn", "ok": "ok  "}.get(f["level"], "?")
+            print(f"{mark}  {f['check']:<22} {f['detail']}")
+            if f["fix"]:
+                print(f"      fix: {f['fix']}")
+    return 1 if any(f["level"] == "fail" for f in findings) else 0
+
+
 COMMANDS = {
     "sync": cmd_sync, "ingest": cmd_ingest, "index": cmd_index, "ocr": cmd_ocr,
+    "doctor": cmd_doctor, "embed": cmd_embed, "brief": cmd_brief,
+    "work": cmd_work,
     "enrich": cmd_enrich, "notes": cmd_notes, "reconcile": cmd_reconcile,
     "call": cmd_call, "serve": cmd_serve, "log": cmd_log, "why": cmd_why,
     "undo": cmd_undo, "status": cmd_status, "budget": cmd_budget,

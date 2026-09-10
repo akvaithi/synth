@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>page.akvaithi.synth.worker</string>
+    <!-- One resident process, not a job per event: Ollama serves one model at a time and
+         synthd is a single socket, so concurrent reactions thrash both. It takes the sweep's
+         own lock, so a reaction and a sweep can never overlap. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/akvaithi/Developer/synth/bin/synth</string>
+        <string>work</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>WorkingDirectory</key>
+    <string>/Users/akvaithi/Developer/synth</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/akvaithi/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <!-- Analyse everything, write nothing. Removed only after a week of `synth log`
+             has been read by hand and the decisions look like ones Arun would have made. -->
+        <key>SYNTH_REACTOR_DRY_RUN</key>
+        <string>1</string>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>/Users/akvaithi/Developer/synth/.state/worker.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/akvaithi/Developer/synth/.state/worker.err.log</string>
+</dict>
+</plist>

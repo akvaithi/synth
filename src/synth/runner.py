@@ -44,16 +44,26 @@ USAGE_TOKENS = ("input_tokens", "output_tokens", "cache_creation_input_tokens",
                 "cache_read_input_tokens")
 
 
+# Jobs that run without Arun watching. They get prompts/autonomy.md on top of the doctrine;
+# nothing else does, and in particular the MCP connector must not -- a session he is driving
+# has no closed list of things it may do unprompted, because it does nothing unprompted.
+UNATTENDED = {"reactor", "brief", "enrich", "triage"}
+
+
 def prompt(name: str, core_only: bool = False, **fmt) -> str:
-    """Assemble a prompt from the doctrine plus one task file."""
+    """Assemble a prompt: the doctrine, the autonomy rules if they apply, then the task."""
     doc = "doctrine-core.md" if core_only else "doctrine.md"
     with open(os.path.join(PROMPTS, doc)) as f:
-        doctrine = f.read()
+        parts = [f.read()]
+    if name in UNATTENDED:
+        with open(os.path.join(PROMPTS, "autonomy.md")) as f:
+            parts.append(f.read())
     with open(os.path.join(PROMPTS, f"{name}.md")) as f:
         body = f.read()
     for k, v in fmt.items():
         body = body.replace("{" + k + "}", v)
-    return f"{doctrine}\n\n---\n\n{body}"
+    parts.append(body)
+    return "\n\n---\n\n".join(parts)
 
 
 def run_claude(prompt_text: str, allowed: list[str], max_turns: int = 40,

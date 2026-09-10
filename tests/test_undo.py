@@ -66,14 +66,22 @@ def test_an_action_is_marked_undone_and_cannot_be_undone_twice(conn, synthd):
     assert len(synthd) == 1, "the second undo reached the daemon anyway"
 
 
-def test_a_creation_is_not_reversed_because_synth_never_deletes(conn, synthd):
+def test_a_creation_is_not_reversed_by_undo(conn, synthd):
+    """Synth can delete now, for the tier Arun drives himself -- and undo still will not.
+
+    Those are separate acts. Letting undo remove a reminder would mean one call could delete
+    something of his as a side effect of tidying up, and for reminders, events and notes the
+    removal cannot be taken back the way an edit can. The message names the tool that does it
+    instead of claiming, as it used to, that no such tool exists.
+    """
     action = db.log_action(conn, "create_reminder", "reminder", "he asked for it",
                            target_id="EK-3", after={"id": "EK-3"})
     message = db.undo(conn, action)
 
-    assert "never deletes" in message
-    assert "EK-3" in message, "the caller is not told what to remove by hand"
-    assert synthd == []
+    assert "undo does not delete" in message
+    assert "delete_reminder" in message, "the caller is not told which tool does it"
+    assert "EK-3" in message, "the caller is not told what to remove"
+    assert synthd == [], "undo must not have reached the daemon at all"
 
 
 def test_an_action_with_no_recorded_prior_state_is_refused(conn, synthd):

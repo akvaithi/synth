@@ -96,7 +96,7 @@ sidestepped by spelling a command differently.
 | `src/synth/watcher.py` | change detection, model-free |
 | `src/synth/runner.py` | headless `claude -p` runs, and the budget they are spent from |
 | `src/synth/tools.py` | the tool layer, transport-independent |
-| `src/synth/mcp_server.py` | stdio MCP (16 tools) |
+| `src/synth/mcp_server.py` | stdio MCP (45 tools: 22 read, 19 write, 4 delete) |
 | `src/synth/http_server.py` | HTTP MCP for the connector (reads and writes) |
 | `src/synth/notes_sync.py` | the two-way Notes mirror |
 | `prompts/` | doctrine, triage, enrich, interview |

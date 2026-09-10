@@ -49,7 +49,14 @@ def _fts_escape(q: str) -> str:
 
 
 def search_context(conn, query: str, limit: int = 20,
-                   include_sensitive: bool = False) -> dict:
+                   include_sensitive: bool = False, mode: str = "hybrid") -> dict:
+    """Search the context database by word and, when asked, by meaning.
+
+    `mode="text"` is the original behaviour exactly: four independent FTS5 MATCH queries.
+    `mode="hybrid"` additionally ranks documents by embedding similarity and fuses the two
+    document lists. The four keys this has always returned keep their names and their shapes,
+    because the doctrine tells every model to start here and a changed shape breaks them all.
+    """
     q = _fts_escape(query)
     out: dict = {"query": query}
     out["entities"] = [dict(r) for r in conn.execute(
@@ -69,15 +76,50 @@ def search_context(conn, query: str, limit: int = 20,
         out["redacted"] = hidden
         out["note"] = (f"{hidden} fact value(s) withheld as sensitive — the predicate is "
                        f"shown. Re-ask with include_sensitive=true if Arun wants the value.")
-    out["documents"] = [dict(r) for r in conn.execute(
+    by_text = [dict(r) for r in conn.execute(
         "SELECT d.id, d.path, d.title, d.chars, "
         "  snippet(document_fts, 1, '<<', '>>', ' … ', 24) AS excerpt "
         "FROM document_fts f JOIN document d ON d.id = f.rowid "
         "WHERE document_fts MATCH ? ORDER BY rank LIMIT ?", (q, limit))]
+    out["documents"] = by_text
     out["links"] = [dict(r) for r in conn.execute(
         "SELECT l.id, l.url, l.title, l.kind FROM link_fts f JOIN link l ON l.id = f.rowid "
         "WHERE link_fts MATCH ? AND l.dismissed = 0 ORDER BY rank LIMIT ?", (q, limit))]
+
+    if mode == "hybrid":
+        out["documents"], out["semantic"] = _fuse_documents(conn, query, by_text, limit)
     return out
+
+
+def _fuse_documents(conn, query: str, by_text: list[dict], limit: int) -> tuple[list, str]:
+    """Blend the keyword ranking with the meaning ranking.
+
+    Fused by reciprocal rank rather than by score, because FTS5's `rank` and a cosine
+    similarity are not comparable quantities and any constant that made them comparable would
+    be a tuning parameter nobody would ever re-tune.
+
+    This must never be the reason search fails. search_context is the most-called tool in the
+    system and the doctrine tells every model to begin with it; if the tunnel is down it
+    returns exactly what it always did, plus a line saying why there is nothing more.
+    """
+    from synth import embed
+
+    for r in by_text:
+        r["found_by"] = "text"
+    try:
+        by_meaning = embed.search(conn, query, limit=limit)
+    except Exception as e:
+        return by_text, f"unavailable — {type(e).__name__}: {e}"
+    if not by_meaning:
+        return by_text, "no vectors yet — run `synth embed --backfill`"
+
+    text_ids = {r["id"] for r in by_text}
+    for r in by_meaning:
+        r["found_by"] = "both" if r["id"] in text_ids else "meaning"
+    fused = embed.rrf(by_text, by_meaning)[:limit]
+    found_both = sum(1 for r in fused if r.get("found_by") == "both")
+    return fused, (f"{len(by_meaning)} by meaning, {len(by_text)} by text, "
+                   f"{found_both} by both")
 
 
 def get_entity(conn, name: str, limit: int = 60, predicate: str = "",
@@ -731,7 +773,8 @@ def create_event(conn, title: str, start: str, reason: str, end: str = None,
         out["duplicate_check_failed"] = gate_failed
         out["advice"] = (
             "The already-scheduled check could not run, so this event was NOT checked against "
-            "the calendar — it was created unchecked, and there is no way to delete an event. "
+            "the calendar — it was created unchecked, and removing an event is a worse fix than "
+            "not creating it: undo reissues it with a new identifier. "
             "Tell Arun immediately so he can remove it if it is a duplicate.")
     try:
         from synth import agenda as _a
@@ -791,6 +834,20 @@ def update_obligation(conn, ek_identifier: str, reason: str, externally_set: boo
     return {"action_id": action_id, "changed": True}
 
 
+def _synth_pointers(conn) -> set:
+    """Reminders Synth created to point at something it produced, rather than at work.
+
+    Identified by provenance rather than by title: action_log records which run created each
+    reminder, and a reminder created by a `brief` run is a pointer to that brief. Matching on
+    the wording would break the first time the title changed.
+    """
+    rows = conn.execute(
+        "SELECT a.target_id FROM action_log a JOIN run_log r ON r.id = a.run_id "
+        "WHERE a.action = 'create_reminder' AND a.target_id IS NOT NULL "
+        "AND r.job = 'brief'")
+    return {r["target_id"] for r in rows}
+
+
 def sync_obligations(conn, run_id=None) -> dict:
     """Reconcile obligation status against what Reminders actually holds.
 
@@ -815,6 +872,7 @@ def sync_obligations(conn, run_id=None) -> dict:
     completed, vanished, reopened, redated = [], [], [], []
     known = {r["ek_identifier"] for r in conn.execute(
         "SELECT ek_identifier FROM obligation WHERE ek_identifier IS NOT NULL")}
+    pointers = _synth_pointers(conn)
 
     # Adopt first, so anything taken on this sweep is reconciled by the loop below in the same
     # pass rather than waiting half an hour for the next one.
@@ -825,6 +883,14 @@ def sync_obligations(conn, run_id=None) -> dict:
         if (r.get("list") or "") in config.LIST_STYLE_LISTS:
             # A grocery item is not owed to anyone, and twenty-nine of them would bury the
             # four things that are. Same carve-out create_reminder already makes.
+            continue
+        if r["id"] in pointers:
+            # A reminder Synth made to point at its own output is not something Arun owes
+            # anyone. The brief deliberately files its reminder through actions.create_reminder
+            # rather than tools.create_reminder to avoid becoming an obligation -- and then
+            # adoption picked it up here anyway, on the next EventKit notification, so "Read
+            # the morning brief" became open work that tomorrow's brief would report as
+            # outstanding. The loop was closed at one door and open at the other.
             continue
         title = (r.get("title") or "").strip()
         if not title:
@@ -968,8 +1034,29 @@ def mail_recent(conn, account: str, limit: int = 25, mailbox: str = "INBOX") -> 
 
 
 def mail_read(conn, account: str, index: int, messageId: str, mailbox: str = "INBOX") -> dict:
-    return call("mail_get_at", account=account, index=index, messageId=messageId,
-                mailbox=mailbox, timeout=600)
+    """Read one message, re-resolving its index if the mailbox moved underneath us.
+
+    A mailbox index is a position, not an address: every arriving message shifts it. The
+    daemon verifies the Message-ID and refuses a mismatch rather than returning the wrong
+    message -- which is the right failure, and leaves the caller holding an error instead of a
+    body. That gap is not hypothetical. A reactor run resolved indexes, spent sixteen seconds
+    deciding, and by the time it read three of them a new message had arrived and every index
+    below it had moved; all three reads failed and the run concluded from subject lines alone.
+
+    Retrying once here closes the race for every caller, rather than each one racing better.
+    """
+    try:
+        return call("mail_get_at", account=account, index=index, messageId=messageId,
+                    mailbox=mailbox, timeout=600)
+    except Exception as e:
+        if "index no longer points at" not in str(e):
+            raise
+        from synth import triage as tri
+        fresh = tri.resolve_indexes([account]).get(account, {}).get(messageId)
+        if not fresh or fresh == index:
+            raise
+        return call("mail_get_at", account=account, index=fresh, messageId=messageId,
+                    mailbox=mailbox, timeout=600)
 
 
 def mail_attachments(conn, account: str, index: int, messageId: str,
@@ -1167,9 +1254,13 @@ def create_note(conn, name: str, body: str, reason: str, folder: str = "",
     action_id = db.log_action(conn, "notes_create", "note", reason, run_id=run_id,
                               target_id=created.get("id"),
                               after={"id": created.get("id"), "name": title, "folder": dest})
+    # Record what Notes stored, or the watcher reads Synth's own note back as a correction
+    # from Arun on the very next sweep.
+    notes_sync.record_write(conn, created.get("id"), dest, title, purpose="note",
+                            action_id=action_id)
     return {"created": True, "action_id": action_id, "id": created.get("id"),
             "name": title, "folder": dest,
-            "note": "Synth never deletes; a note it created has to be removed by hand"}
+            "note": "delete_note moves it to Recently Deleted if Arun asks; Notes keeps it 30 days"}
 
 
 def append_note(conn, note_id: str, text: str, reason: str, run_id=None) -> dict:
@@ -1203,6 +1294,13 @@ def append_note(conn, note_id: str, text: str, reason: str, run_id=None) -> dict
                                   notes_sync.blocks_from_markdown(text))
     action_id, _result = actions.notes_update(
         conn, id=note_id, body=html, reason=reason, run_id=run_id)
+    # The live bug this closes: an append to a NON-mirror note inside the Synth folder was
+    # guarded only by the DOCS check above, so it went through and then came back on the next
+    # poll as an unread correction from Arun.
+    folder = conn.execute("SELECT folder FROM synth_note WHERE note_id = ?",
+                          (note_id,)).fetchone()
+    notes_sync.record_write(conn, note_id, folder["folder"] if folder else config.NOTES_FOLDER,
+                            current.get("name"), purpose="note", action_id=action_id)
     return {"appended": True, "action_id": action_id, "id": note_id,
             "name": current.get("name"),
             "undo": f"undo({action_id}) puts the previous body back"}
@@ -1358,7 +1456,110 @@ def create_document(conn, path: str, text: str, reason: str, run_id=None) -> dic
         args={"path": path, "text": text})
     return {"created": True, "action_id": action_id, "path": rel_path,
             "document_id": index["document_id"], "chars": index["chars"],
-            "note": "Synth never deletes; a file it created has to be removed by hand"}
+            "note": "delete_document removes it if Arun asks, and undo puts it back exactly"}
+
+
+# ---------------------------------------------------------------- deletes
+#
+# Available when Arun is the one asking, and never to the autonomous tier. The capability sets
+# in registry and mcp_server decide who can reach these; nothing here checks, because a tool
+# that guesses at its own caller's authority is a tool that guesses wrong.
+#
+# `retract_reminder` above is NOT superseded by any of this. It stays as the provenance-gated
+# path -- the one the reactor may use -- because "clean up something you created by mistake"
+# and "remove something of Arun's because he asked" are different acts that should not share
+# a single door.
+
+
+def delete_reminder(conn, ek_identifier: str, reason: str, run_id=None) -> dict:
+    """Remove any reminder, including one Arun made himself. He asked; this does it.
+
+    **Undo recreates, it does not restore.** EventKit issues a new identifier on save, so an
+    undone delete is a new reminder that reads the same. Anything referring to the old one by
+    identifier -- an obligation row, a link from a fact -- will not follow it. Prefer
+    `complete_reminder` when the thing is done rather than unwanted; completion keeps the
+    history and this does not.
+    """
+    action_id, result = actions.delete_reminder(
+        conn, id=ek_identifier, reason=reason, run_id=run_id)
+    conn.execute("UPDATE obligation SET status = 'dropped', updated_at = ? "
+                 "WHERE ek_identifier = ?", (db.now(), ek_identifier))
+    conn.commit()
+    return {"action_id": action_id, "removed": (result.get("before") or {}).get("title"),
+            "note": "undo recreates this with a new identifier; it does not restore it"}
+
+
+def delete_event(conn, event_id: str, reason: str, run_id=None) -> dict:
+    """Remove a calendar event.
+
+    The doctrine used to say there was no way to do this, and that was true: it is why it also
+    says to be slow to create one. There is a way now, and the reason to stay slow is
+    unchanged -- **undo recreates, it does not restore.** A recurring event is removed for
+    this occurrence only.
+    """
+    action_id, result = actions.delete_event(conn, id=event_id, reason=reason, run_id=run_id)
+    return {"action_id": action_id, "removed": (result.get("before") or {}).get("title"),
+            "note": "this occurrence only; undo recreates it with a new identifier"}
+
+
+def delete_note(conn, note_id: str, reason: str, run_id=None) -> dict:
+    """Move a note to Recently Deleted, where Notes keeps it for thirty days.
+
+    The most recoverable of the three, and not by anything Synth does: Notes itself holds it
+    and Arun can put it back from the app. Refuses the mirror folder, which is generated from
+    the database — deleting one of those notes removes a rendering, not a fact, and the next
+    sweep writes it again.
+    """
+    from synth import notes_sync
+
+    actions._require_reason(reason)
+    row = conn.execute("SELECT doc FROM notes_mirror WHERE note_id = ?", (note_id,)).fetchone()
+    if row and row["doc"] in notes_sync.DOCS:
+        raise PermissionError(
+            f"{note_id} is the {row['doc']!r} mirror note, rendered from the database. "
+            f"Deleting it removes a rendering, not the underlying facts, and the next sweep "
+            f"writes it back. Change what it is rendered from instead.")
+    action_id, result = actions.delete_note(conn, id=note_id, reason=reason, run_id=run_id)
+    conn.execute("DELETE FROM synth_note WHERE note_id = ?", (note_id,))
+    conn.commit()
+    return {"action_id": action_id, "removed": (result.get("before") or {}).get("name"),
+            "note": "in Recently Deleted for 30 days; Arun can restore it from Notes"}
+
+
+def delete_document(conn, path: str, reason: str, run_id=None) -> dict:
+    """Delete one of Arun's files in the writable folder.
+
+    The only one of the four that is **genuinely reversible**: the previous bytes go to
+    .state/docversions the same way an edit's do, and undo puts the file back exactly as it
+    was, at the same path. The same containment rules as every other document write apply, so
+    `CLAUDE.md` and `CONTEXT.md` are refused and nothing outside the writable folder is
+    reachable.
+    """
+    actions._require_reason(reason)
+    abs_path = docwrite.resolve(path)
+    rel_path = docwrite.relative(abs_path)
+    if not os.path.exists(abs_path):
+        raise FileNotFoundError(f"{rel_path!r} does not exist.")
+
+    before = docwrite.snapshot(rel_path, abs_path)
+    os.unlink(abs_path)
+    doc = conn.execute(
+        "SELECT d.id FROM document d JOIN source s ON s.id = d.source_id "
+        "WHERE s.kind = 'file' AND s.native_id = ?", (rel_path,)).fetchone()
+    if doc:
+        # document_fts is external-content with no AFTER DELETE beyond document_ad, which
+        # does fire on this; the embedding rows go with it by foreign key.
+        conn.execute("DELETE FROM document WHERE id = ?", (doc["id"],))
+        conn.execute("DELETE FROM embedding WHERE kind = 'document' AND ref_id = ?",
+                     (doc["id"],))
+        conn.execute("DELETE FROM embedding_queue WHERE kind = 'document' AND ref_id = ?",
+                     (doc["id"],))
+    action_id = db.log_action(conn, "delete_document", "document", reason, run_id=run_id,
+                              target_id=rel_path, before=before,
+                              args={"path": path})
+    conn.commit()
+    return {"action_id": action_id, "deleted": rel_path,
+            "note": f"undo({action_id}) puts the file back exactly as it was"}
 
 
 def mail_links(conn, account: str, index: int, messageId: str, mailbox: str = "INBOX") -> dict:
