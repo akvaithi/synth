@@ -55,6 +55,11 @@ MAX_WRITES_PER_DAY = int(os.environ.get("SYNTH_MAX_WRITES_PER_DAY", "0"))
 
 MAX_ATTEMPTS = 3
 
+# A claim is held by a process, and processes die. agent.run is capped at ten minutes, so a
+# claim older than this belongs to a worker that is no longer coming back -- the machine
+# slept, launchd restarted it, cloudflared updated underneath it.
+STALE_CLAIM_SECONDS = int(os.environ.get("SYNTH_STALE_CLAIM_SECONDS", "1800"))
+
 
 # Reconciliation is not a write of Arun's. sync_obligations records what EventKit already
 # says -- it creates nothing and changes nothing of his -- and it runs on every EventKit
@@ -91,12 +96,53 @@ def facts_today(conn) -> int:
     ).fetchone()[0]
 
 
+def _alive(pid) -> bool:
+    """Is that process still there? Claims are per-process and only meaningful while it is."""
+    if not pid:
+        return False
+    try:
+        os.kill(int(pid), 0)
+    except (OSError, ValueError, TypeError):
+        return False
+    return True
+
+
+def reap(conn) -> int:
+    """Return claims whose worker is gone, so the work is retried rather than stranded.
+
+    Claiming is what stops two processes reacting to the same message; it also means a worker
+    that dies between claiming and finishing takes its rows with it, because claim() only ever
+    looks at rows where claimed_at IS NULL. One message sat claimed by a dead pid for a full
+    day before anything noticed, and nothing would ever have noticed -- it is not pending, not
+    done, and not failed. It is invisible in every count.
+
+    Liveness is checked by pid first, because that is exact on the machine that made the
+    claim, with an age fallback for the case where the number has been reused by something
+    else entirely.
+    """
+    rows = conn.execute(
+        "SELECT id, claimed_by, claimed_at FROM reaction_queue "
+        "WHERE done_at IS NULL AND claimed_at IS NOT NULL").fetchall()
+    stale = [r["id"] for r in rows
+             if not _alive(r["claimed_by"])
+             or (r["claimed_at"] or "") < db.now_minus(STALE_CLAIM_SECONDS)]
+    if not stale:
+        return 0
+    conn.execute(
+        f"UPDATE reaction_queue SET claimed_at = NULL, claimed_by = NULL, "
+        f"last_error = COALESCE(last_error, 'the worker holding this claim went away') "
+        f"WHERE id IN ({','.join('?' * len(stale))})", stale)
+    conn.commit()
+    return len(stale)
+
+
 def claim(conn, limit: int = 12) -> list[dict]:
     """Take the next batch of pending work, marking it in flight.
 
     Claiming is what a JSON file could not express, and the reason this is a table: the sweep
     and this process are separate, and without a claim the same message is reacted to twice.
     """
+    reap(conn)
     rows = conn.execute(
         "SELECT id, kind, payload, attempts FROM reaction_queue "
         "WHERE done_at IS NULL AND claimed_at IS NULL AND attempts < ? "

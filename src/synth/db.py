@@ -17,6 +17,17 @@ def now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def now_minus(seconds: int) -> str:
+    """An ISO timestamp `seconds` in the past, in the same shape now() produces.
+
+    Comparable as a string against anything now() wrote, which is what makes an age check on
+    claimed_at work without parsing every row.
+    """
+    from datetime import timedelta
+    return (datetime.now(timezone.utc) - timedelta(seconds=seconds)).isoformat(
+        timespec="seconds")
+
+
 def local(ts: str | None, fmt: str = "%Y-%m-%d %H:%M") -> str:
     """Render a stored timestamp in local time.
 
