@@ -119,10 +119,16 @@ def jobs(conn=None) -> list[dict]:
         return [_finding(WARN, "launchd", f"could not list jobs: {e}")]
 
     out = []
+    plists = {}
     for name in sorted(os.listdir(root)) if os.path.isdir(root) else []:
         if not name.endswith(".plist"):
             continue
         label = name[:-len(".plist")]
+        try:
+            with open(os.path.join(root, name)) as f:
+                plists[label] = f.read()
+        except OSError:
+            plists[label] = ""
         if label not in loaded:
             out.append(_finding(WARN, f"job/{label}", "is not loaded",
                                 f"launchctl bootstrap gui/$UID {root}/{name}"))
@@ -141,15 +147,25 @@ def jobs(conn=None) -> list[dict]:
                 continue
             running = pid not in ("-", "0")
             how = SIGNALS.get(status, f"status {status}")
+            # A job that runs on a timer is SUPPOSED to be absent between runs, so "not
+            # running" says nothing about it -- only a resident job being gone is a failure.
+            # Treating them alike reported brief-morning as broken every day of its life,
+            # which is how a real failure ends up buried among expected ones.
+            resident = "KeepAlive" in (plists.get(label) or "")
             if running:
                 out.append(_finding(
                     WARN, f"job/{label}",
                     f"last exited on {how} and has since restarted (now pid {pid})",
                     f"tail {STATE}/{label.split('.')[-1]}.err.log"))
-            else:
+            elif resident:
                 out.append(_finding(
                     FAIL, f"job/{label}", f"exited on {how} and is not running",
                     f"launchctl kickstart -k gui/$UID/{label}"))
+            else:
+                out.append(_finding(
+                    WARN, f"job/{label}",
+                    f"its last scheduled run exited on {how}",
+                    f"tail {STATE}/{label.split('.')[-1]}.out.log"))
     return out
 
 
@@ -297,7 +313,8 @@ def reaction(conn) -> list[dict]:
     if st["halted"]:
         out.append(_finding(WARN, "reactor", "halted: .state/HALT exists, so nothing is "
                                              "being written", "rm .state/HALT"))
-    if st["writes_today"] >= st["cap"]:
+    # `cap` is the string "unlimited" when there is no ceiling, so it cannot be compared.
+    if isinstance(st["cap"], int) and st["cap"] and st["writes_today"] >= st["cap"]:
         out.append(_finding(WARN, "reactor/cap",
                             f"{st['writes_today']} autonomous writes today has reached the "
                             f"daily cap of {st['cap']}; it is analysing but not writing"))

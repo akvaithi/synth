@@ -39,7 +39,7 @@ DENY_ALL = ["Bash", "Read", "Write", "Edit", "MultiEdit", "NotebookEdit", "Glob"
 TRIAGE_MODEL = os.environ.get("SYNTH_TRIAGE_MODEL", "haiku")
 
 USAGE_FIELDS = ("total_cost_usd", "num_turns", "duration_api_ms", "is_error",
-                "stop_reason", "session_id", "subtype", "terminal_reason")
+                "stop_reason", "session_id", "subtype", "terminal_reason", "returncode")
 USAGE_TOKENS = ("input_tokens", "output_tokens", "cache_creation_input_tokens",
                 "cache_read_input_tokens")
 
@@ -96,6 +96,7 @@ def run_claude(prompt_text: str, allowed: list[str], max_turns: int = 40,
         result = json.loads(out)
     except ValueError:
         result = {"is_error": proc.returncode != 0, "result": out[-4000:],
+                  "returncode": proc.returncode,
                   "stderr": proc.stderr.decode("utf-8", errors="replace")[-2000:]}
     # A refusal states when the limit resets. Reading it is the difference between one quiet
     # wait and the 574 rejected calls that once filled two silent days.
@@ -117,6 +118,13 @@ def usage_record(result: dict, **extra) -> str:
     rec["usage"] = {k: u.get(k, 0) for k in USAGE_TOKENS}
     if result.get("backoff"):
         rec["backoff"] = result["backoff"].get("kind")
+    # Why it failed, when it failed. Only the ledger fields were kept, so a run that produced
+    # no output at all recorded nothing about the reason -- the morning brief of 2026-09-11
+    # failed and left "metered brief failed: " with an empty string after it, and the stderr
+    # that would have said why had already been dropped here. Bounded, because the point of
+    # this function is that the record cannot overflow.
+    if result.get("is_error") and result.get("stderr"):
+        rec["stderr"] = str(result["stderr"])[-600:]
     for k, v in extra.items():
         if v:
             rec[k] = v

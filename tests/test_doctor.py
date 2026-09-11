@@ -78,11 +78,17 @@ def test_sigterm_is_how_a_keepalive_job_restarts_not_how_it_fails():
     assert "-15" in doctor.BENIGN_EXIT
 
 
-def _launchctl(monkeypatch, tmp_path, line):
-    """Stand in for `launchctl list`, with one plist on disk to look for."""
+def _launchctl(monkeypatch, tmp_path, line, resident=True):
+    """Stand in for `launchctl list`, with one plist on disk to look for.
+
+    `resident` is the distinction that matters: a KeepAlive job is supposed to be running and
+    its absence is a failure, while a job on a timer is supposed to be absent between runs.
+    """
     import subprocess as sp
     (tmp_path / "launchd").mkdir(exist_ok=True)
-    (tmp_path / "launchd" / "page.akvaithi.synth.tunnel.plist").write_text("<plist/>")
+    body = "<plist><key>KeepAlive</key><true/></plist>" if resident else \
+        "<plist><key>StartCalendarInterval</key><dict/></plist>"
+    (tmp_path / "launchd" / "page.akvaithi.synth.tunnel.plist").write_text(body)
     monkeypatch.setattr(doctor.os.path, "expanduser",
                         lambda p: str(tmp_path / "launchd")
                         if p.endswith("launchd") else os.path.expanduser(p))
@@ -110,6 +116,17 @@ def test_a_job_that_crashed_and_stayed_down_is_a_failure(monkeypatch, tmp_path):
     assert len(found) == 1
     assert found[0]["level"] == doctor.FAIL
     assert "not running" in found[0]["detail"]
+
+
+def test_a_scheduled_job_between_runs_is_not_reported_as_down(monkeypatch, tmp_path):
+    """brief-morning runs at 06:50 and is absent for the other 23 hours. Reporting that as a
+    dead service made it a FAIL every day of its life, which is how a real failure ends up
+    buried among expected ones."""
+    _launchctl(monkeypatch, tmp_path, "-\t1\tpage.akvaithi.synth.tunnel\n", resident=False)
+    found = doctor.jobs()
+    assert len(found) == 1
+    assert found[0]["level"] == doctor.WARN
+    assert "last scheduled run" in found[0]["detail"]
 
 
 def test_a_healthy_job_is_silent(monkeypatch, tmp_path):
