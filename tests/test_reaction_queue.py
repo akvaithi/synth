@@ -10,7 +10,7 @@ import json
 
 import pytest
 
-from synth import watcher, worker
+from synth import db, watcher, worker
 
 
 def _mail(mid, index=1, account="Work"):
@@ -168,3 +168,52 @@ def test_status_says_nothing_rather_than_guessing_when_no_worker_has_run(conn, t
                                                                         monkeypatch):
     monkeypatch.setattr(worker, "MODE_FILE", str(tmp_path / "absent.json"))
     assert worker.status(conn)["worker_dry_run"] is None
+
+
+# ---------------------------------------------------------------- claims outlive workers
+
+def test_a_claim_held_by_a_dead_worker_is_returned(conn):
+    """Claiming is what stops two processes reacting to the same message; it also means a
+    worker that dies between claiming and finishing takes its rows with it, because claim()
+    only ever looks at rows where claimed_at IS NULL. One message sat claimed by a dead pid
+    for a full day, and nothing would ever have noticed: it is not pending, not done, and not
+    failed. It is invisible in every count."""
+    watcher.enqueue(conn, [_mail("<a@x>")])
+    conn.execute("UPDATE reaction_queue SET claimed_at = ?, claimed_by = 999999",
+                 (db.now(),))
+    conn.commit()
+    assert worker.claim(conn), "a dead worker's claim was never returned"
+
+
+def test_a_claim_held_by_a_living_worker_is_left_alone(conn):
+    """The other half. Reaping a live claim is worse than stranding a dead one -- it hands the
+    same message to a second process while the first is still working it."""
+    import os
+
+    watcher.enqueue(conn, [_mail("<a@x>")])
+    conn.execute("UPDATE reaction_queue SET claimed_at = ?, claimed_by = ?",
+                 (db.now(), os.getpid()))
+    conn.commit()
+    assert worker.reap(conn) == 0
+    assert worker.claim(conn) == []
+
+
+def test_a_claim_older_than_any_run_is_returned_even_if_the_pid_exists(conn):
+    """Pids are reused. A run is capped at ten minutes, so a claim far older than that belongs
+    to a worker that is not coming back whatever is answering to its number now."""
+    import os
+
+    watcher.enqueue(conn, [_mail("<a@x>")])
+    conn.execute("UPDATE reaction_queue SET claimed_at = ?, claimed_by = ?",
+                 (db.now_minus(worker.STALE_CLAIM_SECONDS + 60), os.getpid()))
+    conn.commit()
+    assert worker.reap(conn) == 1
+
+
+def test_reaping_records_why_the_row_came_back(conn):
+    watcher.enqueue(conn, [_mail("<a@x>")])
+    conn.execute("UPDATE reaction_queue SET claimed_at = ?, claimed_by = 999999", (db.now(),))
+    conn.commit()
+    worker.reap(conn)
+    assert "went away" in conn.execute(
+        "SELECT last_error FROM reaction_queue").fetchone()["last_error"]
